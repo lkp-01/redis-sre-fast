@@ -1,0 +1,1571 @@
+"""
+Lightweight Chat Agent for fast Redis instance interaction.
+
+This agent is designed for quick Q&A when a Redis instance is available
+but the user doesn't need a full health check or triage. It has access
+to all Redis tools but uses a simpler workflow without deep research
+or safety-evaluation chains.
+"""
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, NotRequired, Optional, TypedDict
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
+from langgraph.errors import GraphInterrupt
+from langgraph.graph import END, StateGraph
+from langgraph.types import Command
+from opentelemetry import trace
+
+from redis_sre_agent.core.agent_memory import prepare_agent_turn_memory
+from redis_sre_agent.core.clusters import RedisCluster
+from redis_sre_agent.core.config import settings
+from redis_sre_agent.core.instances import RedisInstance
+from redis_sre_agent.core.llm_helpers import create_llm, create_mini_llm
+from redis_sre_agent.core.llm_request_guard import guarded_ainvoke
+from redis_sre_agent.core.progress import (
+    NullEmitter,
+    ProgressEmitter,
+)
+from redis_sre_agent.core.redis import get_redis_client
+from redis_sre_agent.core.targets import (
+    build_attached_target_prompt_fallback,
+    build_attached_target_prompt_loader,
+    build_attached_target_scope_prompt,
+    build_single_attached_binding_prompt,
+    get_attached_target_handles_from_context,
+)
+from redis_sre_agent.core.turn_scope import TurnScope
+from redis_sre_agent.skills.contracts import (
+    TEMPLATE_PLACEHOLDER_RE,
+    template_segment_to_pattern,
+)
+from redis_sre_agent.tools.manager import ToolManager
+from redis_sre_agent.tools.models import ToolCapability
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from .checkpointing import (
+    build_graph_config,
+    open_graph_checkpointer,
+    persist_approval_wait_state,
+    persist_checkpoint_metadata,
+    resolve_graph_thread_id,
+)
+from .helpers import build_result_envelope, coerce_response_text, extract_last_ai_response
+from .knowledge_context import build_startup_knowledge_context, merge_internal_tool_envelopes
+from .models import AgentResponse
+from .prompts import REDIS_COMMAND_SEMANTICS_GUARDRAILS
+from .terminal_synthesis import (
+    TerminalSynthesisConfig,
+    describe_captured_state,
+    synthesize_terminal_response,
+)
+from .tool_execution import execute_tool_calls_with_gate
+
+logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+
+
+def _normalize_contract_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _contract_requirement_label(requirement: Any) -> str:
+    if isinstance(requirement, dict):
+        operation = str(requirement.get("operation") or "").strip()
+        server_name = str(requirement.get("server_name") or "").strip()
+        if operation and server_name:
+            return f"{server_name}.{operation}"
+        if operation:
+            return operation
+    return str(requirement or "").strip()
+
+
+def _tool_requirement_matches(requirement: Any, envelope: Dict[str, Any]) -> bool:
+    tool_key = _normalize_contract_token(envelope.get("tool_key"))
+    tool_name = _normalize_contract_token(envelope.get("name"))
+    candidates = [candidate for candidate in (tool_key, tool_name) if candidate]
+    if not candidates:
+        return False
+
+    if isinstance(requirement, dict):
+        required_operation = _normalize_contract_token(requirement.get("operation"))
+        required_server = _normalize_contract_token(requirement.get("server_name"))
+        if not required_operation:
+            return False
+        for candidate in candidates:
+            if not (
+                candidate == required_operation or candidate.endswith(f"_{required_operation}")
+            ):
+                continue
+            if required_server and required_server not in candidate:
+                continue
+            return True
+        return False
+
+    required = _normalize_contract_token(requirement)
+    if not required:
+        return False
+    return any(
+        candidate == required or candidate.endswith(f"_{required}") for candidate in candidates
+    )
+
+
+def _required_pattern_entries(output_contract: Dict[str, Any]) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    for item in output_contract.get("required_patterns") or []:
+        if isinstance(item, dict):
+            pattern = str(item.get("pattern") or "").strip()
+            description = str(item.get("description") or pattern).strip()
+        else:
+            pattern = str(item or "").strip()
+            description = pattern
+        if pattern:
+            entries.append({"pattern": pattern, "description": description})
+    return entries
+
+
+def _contract_template_token_matches(token: str, response_text: str) -> bool:
+    if TEMPLATE_PLACEHOLDER_RE.search(token):
+        return re.search(rf"(?m)^{template_segment_to_pattern(token)}$", response_text) is not None
+    return token in response_text
+
+
+def _missing_output_contract_items(
+    output_contract: Dict[str, Any],
+    response_text: str,
+) -> List[str]:
+    if not response_text.strip():
+        return ["Return the required markdown document."]
+
+    missing: List[str] = []
+    for line in output_contract.get("required_preamble_lines") or []:
+        literal = str(line or "").strip()
+        if "<" in literal:
+            literal = literal.split("<", 1)[0].rstrip()
+        if literal and literal not in response_text:
+            missing.append(f"Include `{literal}` in the report preamble.")
+
+    cursor = 0
+    for heading in output_contract.get("required_order") or []:
+        token = str(heading or "").strip()
+        if not token:
+            continue
+        position = response_text.find(token, cursor)
+        if position == -1:
+            missing.append(f"Include heading `{token}` in the required order.")
+            continue
+        cursor = position + len(token)
+
+    for heading in output_contract.get("required_subsections") or []:
+        token = str(heading or "").strip()
+        if not token or _contract_template_token_matches(token, response_text):
+            continue
+        if TEMPLATE_PLACEHOLDER_RE.search(token):
+            missing.append(f"Include a subsection matching `{token}`.")
+            continue
+        missing.append(f"Include subsection `{token}`.")
+
+    for pattern_entry in _required_pattern_entries(output_contract):
+        try:
+            if re.search(pattern_entry["pattern"], response_text):
+                continue
+        except re.error:
+            pass
+        missing.append(pattern_entry["description"])
+
+    return missing
+
+
+def _extract_active_skill_contracts(
+    envelopes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    contracts: List[Dict[str, Any]] = []
+    for envelope in envelopes:
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            continue
+        output_contract = data.get("output_contract")
+        workflow_contract = data.get("workflow_contract")
+        contract_summary = data.get("contract_summary")
+        if not output_contract and not workflow_contract and not contract_summary:
+            continue
+        contracts.append(
+            {
+                "skill_name": str(
+                    data.get("skill_name") or envelope.get("name") or "skill"
+                ).strip(),
+                "output_contract": output_contract if isinstance(output_contract, dict) else {},
+                "workflow_contract": (
+                    workflow_contract if isinstance(workflow_contract, dict) else {}
+                ),
+                "contract_summary": [
+                    str(item).strip() for item in (contract_summary or []) if str(item).strip()
+                ],
+            }
+        )
+    return contracts
+
+
+def _collect_skill_contract_gaps(
+    envelopes: List[Dict[str, Any]],
+    messages: List[BaseMessage],
+) -> List[Dict[str, Any]]:
+    response_text = extract_last_ai_response(messages, terminal_only=True)
+    gaps: List[Dict[str, Any]] = []
+    for contract in _extract_active_skill_contracts(envelopes):
+        workflow_contract = contract["workflow_contract"]
+        output_contract = contract["output_contract"]
+        missing_tools = [
+            _contract_requirement_label(requirement)
+            for requirement in (workflow_contract.get("required_tool_calls") or [])
+            if not any(_tool_requirement_matches(requirement, envelope) for envelope in envelopes)
+        ]
+        missing_output = (
+            _missing_output_contract_items(output_contract, response_text) if response_text else []
+        )
+        if not missing_tools and not missing_output:
+            continue
+        gaps.append(
+            {
+                "skill_name": contract["skill_name"],
+                "missing_tools": missing_tools,
+                "missing_output": missing_output,
+                "template": str(output_contract.get("template") or "").strip(),
+                "required_followups": [
+                    str(item).strip()
+                    for item in (workflow_contract.get("required_followups") or [])
+                    if str(item).strip()
+                ],
+                "contract_summary": contract["contract_summary"],
+            }
+        )
+    return gaps
+
+
+def _build_skill_contract_repair_message(
+    envelopes: List[Dict[str, Any]],
+    messages: List[BaseMessage],
+    gaps: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[SystemMessage]:
+    gaps = gaps if gaps is not None else _collect_skill_contract_gaps(envelopes, messages)
+    if not gaps:
+        return None
+
+    lines = [
+        "Binding skill contract reminder:",
+        "Do not finalize yet until you satisfy the retrieved skill contract.",
+    ]
+    for gap in gaps:
+        lines.append(f"Skill: `{gap['skill_name']}`")
+        if gap["missing_tools"]:
+            lines.append(
+                "Missing required tool calls: "
+                + ", ".join(f"`{name}`" for name in gap["missing_tools"])
+            )
+        if gap["required_followups"]:
+            lines.append("Required follow-up rules:")
+            for item in gap["required_followups"]:
+                lines.append(f"- {item}")
+        if gap["missing_output"]:
+            lines.append("Missing required output constraints:")
+            for item in gap["missing_output"]:
+                lines.append(f"- {item}")
+    lines.append(
+        "When the contract requires exact headings or layout, copy them verbatim. "
+        "Return only the required markdown document and do not append extra footer text "
+        "unless the contract explicitly asks for it."
+    )
+    return SystemMessage(content="\n".join(lines))
+
+
+def _skill_contract_gaps_need_followup(gaps: List[Dict[str, Any]]) -> bool:
+    return any(gap["missing_output"] and not gap["missing_tools"] for gap in gaps)
+
+
+def _format_exception_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+
+    if exc.args:
+        return f"{type(exc).__name__}: {exc.args!r}"
+    return type(exc).__name__
+
+
+CHAT_SYSTEM_PROMPT = f"""You are a Redis SRE agent with access to tools for investigating Redis deployments.
+
+## Your Approach - ITERATIVE INVESTIGATION
+
+Work step by step. Don't try to gather all information at once.
+
+1. **Make a few targeted tool calls** (2-4 max per turn)
+2. **Analyze the results** - think about what you learned
+3. **Decide what to do next** - either answer or make more targeted calls
+4. **Repeat** until you have enough information to answer
+
+This iterative approach prevents overwhelming context limits and produces better analysis.
+
+## Tool Calling Guidelines
+
+**Per turn, call at most 3-4 tools.** Analyze results before calling more.
+
+For Redis diagnostics:
+- Start with diagnostics-category tools for a comprehensive overview
+- Add diagnostics/admin-api category tools for Redis Enterprise/Cloud configuration details
+- Add knowledge-category tools when you need troubleshooting guidance
+- For Redis Enterprise CRDB/Active-Active questions, do not decide from `get_database`
+  alone. Call the available CRDB admin-api tools first: `list_crdbs` to confirm
+  CRDB identity/topology, then `get_crdb`, `get_crdb_health_report`,
+  `get_crdt_syncer_state`, `get_sync_source_stats`, and `get_logs` as needed for
+  peers/sites, link status, syncer state, lag, and recent CRDB/CRDT/resync events.
+  Match CRDBs by CRDB name, CRDB GUID, local BDB UID, or instance DB UID. Do not
+  declare a database "not CRDB" solely because optional CRDT fields are absent
+  from a BDB response. If multiple CRDBs match the requested name or UID, ask for
+  clarification instead of choosing one. If `list_crdbs` returns no matches, say
+  no CRDB was found only after reporting that CRDB inventory check.
+
+For code/repo investigation:
+- **First:** One targeted repos-category search with a specific query
+- **Analyze:** Look at search results, identify the most relevant file
+- **Then:** Fetch one relevant file from repos-category tools
+- **Repeat:** If needed, fetch another file based on what you learned
+
+For metrics/logs:
+- Be specific with queries - broad queries return too much data
+- Fetch one metric or log query at a time
+
+For target discovery:
+- If the user asks what Redis targets you know about, call `list_known_redis_targets`
+- If the user describes a target but has not given `instance_id` or `cluster_id`, call `resolve_redis_targets` before making live-state claims
+- Only treat target discovery as confirmed when it returns an exact live match. If the match is fuzzy, partial, or ambiguous, ask the user to confirm the target before you attach tools or describe live state
+- If the user asks to compare or investigate multiple targets, call `resolve_redis_targets` with `allow_multiple=true`, keep the attached target set, and gather evidence per target before comparing
+- If target discovery returns `status="too_many_matches"`, do not attach or inspect a partial target set. Say there are too many Redis targets, ask the user to narrow the request to the reported `max_selectable` target count, and include "5 or fewer targets" when `max_selectable` is 5
+- If the user asks both "what do you know about?" and asks to drill into one target in the same turn, list first, then resolve the chosen target and continue with the attached live tools
+- A hostname or hostname fragment is not enough to assume a live Redis target. If target discovery does not return an exact live match, do not attach or describe a different Redis deployment as if it were that hostname
+
+For historical incident context (if `tickets` tools are available):
+- Use tickets tools instead of general knowledge search because general knowledge search excludes support tickets
+- Search support tickets with concrete identifiers (cluster name/host, error strings)
+- Fetch the most relevant ticket record for full details
+
+For skills, runbooks, and evidence-backed workflows:
+- A skill name shown in startup context is inventory only, not proof that you retrieved or executed that skill
+- If a listed or requested skill is relevant, fetch it with `get_skill` before claiming you followed it or improvising the workflow from memory
+- Do not say you "used the health check skill", "followed the runbook", or "reviewed the support ticket" unless you actually retrieved that artifact in this conversation
+- Do not present a response as satisfying a skill unless you successfully retrieved and followed the skill
+- If a retrieved skill returns `output_contract`, `workflow_contract`, or `contract_summary`, treat those fields as binding instructions for this turn
+- When a skill contract specifies exact headings or ordering, copy those headings verbatim instead of paraphrasing them
+- When a skill contract specifies required tool calls or follow-up rules, complete them before you finalize unless the user blocks you or the tool is unavailable
+- Before sending the final answer, silently check that every required section from the skill contract is present and in order
+- Return only the requested document or answer body. Do not append a skill-usage footer unless the skill contract explicitly requires one
+- If the user asks for a health check, cluster audit, review, or support-package style finding, prefer the relevant skill and evidence from available tools over ad hoc live Redis diagnostics unless the user explicitly names a live instance/cluster or target discovery returns an exact live match
+- If the request only includes a hostname and it does not resolve exactly as a live target, ask for package/account/cluster context or continue with the retrieved skill workflow instead of guessing
+- Support-package findings describe captured package contents, not the current live state of a hostname or cluster
+
+Only call categories that are available in your current tool list.
+
+## What NOT to Do
+
+- ❌ Don't call 5+ tools in parallel
+- ❌ Don't run multiple variations of the same search
+- ❌ Don't fetch multiple files at once - read one, analyze, then decide if you need more
+- ❌ Don't try to gather everything upfront
+
+## Guidelines
+- Answer questions iteratively - it's OK to take multiple turns
+- Start with the most likely source of relevant info
+- Be conversational about what you're finding and what you'll check next
+- For truly exhaustive multi-topic analysis, suggest "deep triage"
+
+{REDIS_COMMAND_SEMANTICS_GUARDRAILS}
+
+## Redis Enterprise / Redis Cloud Notes
+- For managed Redis, INFO output can be misleading
+- Use available diagnostics/admin-api tools for accurate configuration details
+- Don't suggest CONFIG SET for managed deployments
+- For Redis Enterprise CRDB/Active-Active checks, `list_crdbs` is the source of
+  truth before saying whether a database is part of a CRDB.
+"""
+
+
+class ChatAgentState(TypedDict):
+    """State for the chat agent."""
+
+    messages: List[BaseMessage]
+    session_id: str
+    user_id: Optional[str]
+    current_tool_calls: List[Dict[str, Any]]
+    iteration_count: int
+    max_iterations: int
+    startup_system_prompt: Optional[str]
+    startup_prompt_initialized: NotRequired[bool]
+    toolset_generation: NotRequired[int]
+    skill_contract_repair_attempts: NotRequired[int]
+    skill_contract_gaps: NotRequired[List[Dict[str, Any]]]
+    # Accumulated tool result envelopes for context management and citation derivation
+    signals_envelopes: List[Dict[str, Any]]
+
+
+class ChatAgent:
+    """Lightweight LangGraph-based agent for quick Redis Q&A.
+
+    This agent has access to all Redis tools but uses a simpler workflow
+    optimized for fast, targeted responses rather than comprehensive triage.
+    """
+
+    # Threshold for summarizing tool outputs (chars)
+    ENVELOPE_SUMMARY_THRESHOLD = 500
+    ITERATION_LIMIT_SYNTHESIS_MESSAGE_LIMIT = 14
+    ITERATION_LIMIT_SYNTHESIS_CONTEXT_LIMIT = 16000
+    ITERATION_LIMIT_SYNTHESIS_ITEM_LIMIT = 2000
+    SKILL_CONTRACT_REPAIR_ATTEMPT_LIMIT = 1
+
+    def _can_attempt_skill_contract_repair(self, state: Dict[str, Any]) -> bool:
+        return (
+            state.get("skill_contract_repair_attempts", 0)
+            < self.SKILL_CONTRACT_REPAIR_ATTEMPT_LIMIT
+        )
+
+    def __init__(
+        self,
+        redis_instance: Optional[RedisInstance] = None,
+        redis_cluster: Optional[RedisCluster] = None,
+        progress_emitter: Optional[ProgressEmitter] = None,
+        exclude_mcp_categories: Optional[List["ToolCapability"]] = None,
+        support_package_path: Optional["Path"] = None,
+    ):
+        """Initialize the Chat agent.
+
+        Args:
+            redis_instance: Optional Redis instance for context
+            redis_cluster: Optional Redis cluster for cluster-scoped context
+            progress_emitter: Emitter for progress/notification updates
+            exclude_mcp_categories: Optional list of MCP tool capability categories to exclude.
+                Use this to filter out specific types of MCP tools. Common categories:
+                METRICS, LOGS, TICKETS, REPOS, TRACES, DIAGNOSTICS, KNOWLEDGE, UTILITIES.
+            support_package_path: Optional path to an extracted support package.
+                When provided, loads tools for analyzing logs, diagnostics, and
+                Redis data from the package.
+        """
+        self.settings = settings
+        self.redis_instance = redis_instance
+        self.redis_cluster = redis_cluster
+        self.exclude_mcp_categories = exclude_mcp_categories
+        self.support_package_path = support_package_path
+
+        self._emitter = progress_emitter if progress_emitter is not None else NullEmitter()
+
+        self.llm = create_llm()
+        self.mini_llm = create_mini_llm()
+
+        logger.info(
+            f"Chat agent initialized (instance: {redis_instance.name if redis_instance else 'none'})"
+        )
+
+    def _build_expand_evidence_tool(
+        self,
+        envelopes_container: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Build a tool that allows the LLM to retrieve full tool output details.
+
+        When we summarize tool outputs, the LLM only sees condensed versions.
+        This tool lets the LLM request the full original output for any tool_key
+        if it needs more detail. Supports optional JMESPath queries for extracting
+        specific data.
+
+        The tool is available from the start but references a mutable container
+        that gets populated as tool calls complete. This ensures the LLM knows
+        the tool exists and can plan to use it after making other tool calls.
+
+        Args:
+            envelopes_container: A mutable dict with "envelopes" key that gets
+                                 updated as tool calls complete
+
+        Returns:
+            A dict with name, description, func, and parameters for creating a tool
+        """
+        import jmespath
+        from jmespath.exceptions import JMESPathError
+
+        def expand_evidence(tool_key: str, query: Optional[str] = None) -> Dict[str, Any]:
+            """Retrieve full or queried data from a previous tool call.
+
+            Args:
+                tool_key: The tool_key from a summarized evidence item
+                query: Optional JMESPath expression to extract specific data
+            """
+            # Get current envelopes from the mutable container
+            envelopes = envelopes_container.get("envelopes", [])
+            originals_by_key = {e.get("tool_key"): e for e in envelopes}
+            available_keys = list(originals_by_key.keys())
+
+            if not available_keys:
+                return {
+                    "status": "error",
+                    "error": (
+                        "No tool calls have been made yet. "
+                        "First call other tools to gather data, then use expand_evidence "
+                        "to retrieve or query their results."
+                    ),
+                }
+
+            if tool_key not in originals_by_key:
+                return {
+                    "status": "error",
+                    "error": f"Unknown tool_key: '{tool_key}'. Available tool_keys: {available_keys}. "
+                    "Use one of the available tool_keys from a previous tool call.",
+                }
+            original = originals_by_key[tool_key]
+            data = original.get("data", {})
+
+            # If query is provided, use JMESPath to extract data
+            if query:
+                try:
+                    queried_data = jmespath.search(query, data)
+                    return {
+                        "status": "success",
+                        "tool_key": tool_key,
+                        "name": original.get("name"),
+                        "query": query,
+                        "queried_data": queried_data,
+                    }
+                except JMESPathError as e:
+                    # Provide helpful error with syntax hints
+                    return {
+                        "status": "error",
+                        "error": f"Invalid JMESPath query '{query}': {e}. "
+                        "JMESPath syntax tips: "
+                        "- Access nested fields: 'field.subfield' "
+                        "- Get all items from array field: 'results[*].fieldname' "
+                        "- Slice arrays: 'items[:5]' (first 5) or 'items[-3:]' (last 3) "
+                        "- Filter: 'items[?score > `0.5`]' (note: numbers need backticks) "
+                        "- Project multiple fields: 'results[*].{name: title, url: source}'",
+                    }
+
+            # No query - return full data
+            return {
+                "status": "success",
+                "tool_key": tool_key,
+                "name": original.get("name"),
+                "full_data": data,
+            }
+
+        return {
+            "name": "expand_evidence",
+            "description": (
+                "Retrieve or query data from a previous tool call using JMESPath. "
+                "IMPORTANT: The tool_key parameter must be the exact function name you called "
+                "(e.g., 'knowledge_abc123_search', 'redis_info'), NOT document IDs, Redis keys, "
+                "or any values from inside the tool's results. "
+                "JMESPath examples: 'results[*].title' extracts all titles, "
+                "'entries[:3]' gets first 3 items, "
+                "'items[?score > `0.8`]' filters by condition."
+            ),
+            "func": expand_evidence,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_key": {
+                        "type": "string",
+                        "description": (
+                            "The exact function name you previously called (e.g., 'knowledge_abc123_search', "
+                            "'redis_info'). This is the tool/function name from your tool call, NOT a "
+                            "document ID, Redis key, or value from inside the results."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "JMESPath expression to extract specific data. "
+                            "Common patterns: "
+                            "'fieldname' - get a field, "
+                            "'results[*].title' - extract field from all array items, "
+                            "'results[:5]' - first 5 items, "
+                            "'results[?score > `0.5`]' - filter (numbers in backticks), "
+                            "'results[*].{name: title, link: source}' - project/rename fields. "
+                            "Omit to get full data."
+                        ),
+                    },
+                },
+                "required": ["tool_key"],
+            },
+        }
+
+    def _tool_call_progress_message(
+        self,
+        tool_mgr: ToolManager,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> str:
+        """Build the user-facing progress message for a tool call."""
+        status_msg = tool_mgr.get_status_update(tool_name, tool_args)
+        if status_msg:
+            return status_msg
+
+        if tool_name == "expand_evidence":
+            query = str(tool_args.get("query") or "").strip()
+            message = (
+                "I have a preview of the last tool call's output. "
+                "I'm retrieving the full output now."
+            )
+            if query:
+                message += f" Applying JMESPath query: {query}"
+            return message
+
+        return f"Executing tool: {tool_name}"
+
+    def _summarize_envelope_sync(self, env: Dict[str, Any]) -> Dict[str, Any]:
+        """Set summary field for large envelope data, preserving full data.
+
+        For chat agent, we use simple truncation rather than LLM summarization
+        to keep things fast. The full `data` is always preserved for:
+        - Decision traces (`task trace` CLI)
+        - The `expand_evidence` tool
+        - Future query capabilities
+        """
+        data_str = json.dumps(env.get("data", {}), default=str)
+        if len(data_str) <= self.ENVELOPE_SUMMARY_THRESHOLD:
+            return env
+
+        # Set summary, keep full data
+        env = dict(env)  # Copy to avoid mutating original
+        env["summary"] = (
+            data_str[: self.ENVELOPE_SUMMARY_THRESHOLD]
+            + f"... (use expand_evidence for full {len(data_str)} chars)"
+        )
+        return env
+
+    def _create_summarized_tool_message(
+        self, original_msg: ToolMessage, tool_key: str, data: Dict[str, Any]
+    ) -> ToolMessage:
+        """Create a summarized ToolMessage for the LLM when data is large.
+
+        The LLM receives a preview with structure hints and instructions on how
+        to use expand_evidence to get full data or query specific fields.
+        """
+        data_str = json.dumps(data, default=str)
+        total_size = len(data_str)
+
+        if total_size <= self.ENVELOPE_SUMMARY_THRESHOLD:
+            # Small enough - return original message unchanged
+            return original_msg
+
+        # Build a helpful preview showing structure
+        preview_lines = []
+
+        # WARNING and instructions FIRST - most important info at top
+        preview_lines.append(f"⚠️ LARGE RESULT ({total_size:,} chars) - DATA TRUNCATED")
+        preview_lines.append("You are NOT seeing the full data. Use expand_evidence to access it:")
+        preview_lines.append(f"  expand_evidence(tool_key='{tool_key}')")
+        preview_lines.append(f"  expand_evidence(tool_key='{tool_key}', query='results[*].source')")
+        preview_lines.append("")
+
+        # Show structure: top-level keys and their types/sizes
+        if isinstance(data, dict):
+            preview_lines.append("Data structure:")
+            for key, value in list(data.items())[:10]:  # First 10 keys
+                if isinstance(value, list) and len(value) > 0:
+                    # Show list length AND first item's keys if it's a dict
+                    if isinstance(value[0], dict):
+                        item_keys = list(value[0].keys())[:8]
+                        preview_lines.append(
+                            f"  {key}: [{len(value)} items] each with keys: {item_keys}"
+                        )
+                    else:
+                        preview_lines.append(f"  {key}: [{len(value)} items]")
+                elif isinstance(value, list):
+                    preview_lines.append(f"  {key}: [empty]")
+                elif isinstance(value, dict):
+                    preview_lines.append(f"  {key}: {{...}}")
+                elif isinstance(value, str) and len(value) > 50:
+                    preview_lines.append(f'  {key}: "{value[:50]}..."')
+                else:
+                    val_str = json.dumps(value, default=str)
+                    if len(val_str) > 60:
+                        val_str = val_str[:60] + "..."
+                    preview_lines.append(f"  {key}: {val_str}")
+
+        # Brief preview of the data
+        preview_lines.append("")
+        preview_lines.append(f"Preview (first {self.ENVELOPE_SUMMARY_THRESHOLD} chars):")
+        preview_lines.append(data_str[: self.ENVELOPE_SUMMARY_THRESHOLD] + "...")
+
+        summarized_content = "\n".join(preview_lines)
+
+        return ToolMessage(
+            content=summarized_content,
+            tool_call_id=original_msg.tool_call_id,
+            name=original_msg.name if hasattr(original_msg, "name") else None,
+        )
+
+    async def _repair_response_to_skill_contract(
+        self,
+        *,
+        response_text: str,
+        tool_envelopes: List[Dict[str, Any]],
+        messages: List[BaseMessage],
+    ) -> str:
+        """Rewrite a final answer to satisfy binding skill output contracts.
+
+        This is a formatting-only repair pass. It must preserve the already-gathered
+        evidence and never introduce new tool calls or unsupported claims.
+        """
+        gaps = _collect_skill_contract_gaps(tool_envelopes, messages)
+        relevant_gaps = [gap for gap in gaps if gap["missing_output"] and not gap["missing_tools"]]
+        if not relevant_gaps:
+            return response_text
+
+        lines = [
+            "You are repairing an answer so it exactly satisfies a binding Agent Skills output contract.",
+            "Do not add new evidence, findings, or tool claims.",
+            "Preserve the facts, metrics, and recommendations already present in the source answer.",
+            "Return only the rewritten markdown document.",
+            "",
+            "Contracts to satisfy:",
+        ]
+        for gap in relevant_gaps:
+            lines.append(f"Skill: `{gap['skill_name']}`")
+            if gap["contract_summary"]:
+                lines.extend(f"- {item}" for item in gap["contract_summary"])
+            lines.append("Missing output requirements:")
+            lines.extend(f"- {item}" for item in gap["missing_output"])
+            if gap["template"]:
+                lines.append("Required markdown template:")
+                lines.append("```markdown")
+                lines.append(gap["template"])
+                lines.append("```")
+
+        repair_messages: List[BaseMessage] = [
+            SystemMessage(content="\n".join(lines)),
+            HumanMessage(
+                content=(
+                    "Rewrite the following answer to satisfy the contract exactly.\n\n"
+                    "Original answer:\n"
+                    f"{response_text}"
+                )
+            ),
+        ]
+        try:
+            repaired = await guarded_ainvoke(
+                self.llm,
+                repair_messages,
+                request_kind="chat_agent.skill_contract_repair",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skill contract repair failed; returning original response: %s",
+                _format_exception_message(exc),
+                exc_info=True,
+            )
+            return response_text
+        repaired_text = coerce_response_text(getattr(repaired, "content", ""))
+        return repaired_text or response_text
+
+    async def _repair_final_response_to_skill_contract(
+        self,
+        *,
+        response_text: str,
+        tool_envelopes: List[Dict[str, Any]],
+        messages: List[BaseMessage],
+        final_state: Dict[str, Any],
+    ) -> str:
+        if not self._can_attempt_skill_contract_repair(final_state):
+            return response_text
+        return await self._repair_response_to_skill_contract(
+            response_text=response_text,
+            tool_envelopes=tool_envelopes,
+            messages=messages,
+        )
+
+    @staticmethod
+    def _reached_iteration_limit(
+        final_state: Dict[str, Any], requested_max_iterations: int
+    ) -> bool:
+        iteration_count = final_state.get("iteration_count")
+        max_iterations = final_state.get("max_iterations", requested_max_iterations)
+        if not isinstance(iteration_count, int) or not isinstance(max_iterations, int):
+            return False
+        return iteration_count >= max_iterations
+
+    @staticmethod
+    def _iteration_limit_failure_response(
+        *,
+        iteration_count: int,
+        max_iterations: int,
+        messages: List[BaseMessage],
+        tool_envelopes: List[Dict[str, Any]],
+    ) -> str:
+        gathered_text = describe_captured_state(messages=messages, tool_envelopes=tool_envelopes)
+        return (
+            f"I reached the chat iteration limit ({iteration_count}/{max_iterations}) "
+            "before producing a final answer. I was trying to answer the current request "
+            f"and had gathered {gathered_text}. The final synthesis step did not return "
+            "usable text, so I cannot complete the turn cleanly from the captured state."
+        )
+
+    async def _synthesize_iteration_limit_response(
+        self,
+        *,
+        messages: List[BaseMessage],
+        tool_envelopes: List[Dict[str, Any]],
+        iteration_count: int,
+        max_iterations: int,
+    ) -> str:
+        """Produce a terminal answer after the graph loop exhausts its turn budget."""
+        return await synthesize_terminal_response(
+            self.llm,
+            config=TerminalSynthesisConfig(
+                request_kind="chat_agent.iteration_limit_synthesis",
+                system_prompt=(
+                    "The chat workflow stopped because it reached its iteration budget "
+                    "before emitting terminal assistant text. Write the best possible final "
+                    "answer from the gathered conversation and tool evidence. Do not call "
+                    "tools. Do not claim evidence that is not present. If the evidence is "
+                    "incomplete, say what was gathered and what remains uncertain."
+                ),
+                messages_heading="Conversation tail",
+                evidence_heading="Structured tool evidence",
+                no_messages_text="No non-system conversation messages were captured.",
+                no_evidence_text="No structured tool result envelopes were captured.",
+                failure_log_message="Chat agent max-iteration synthesis failed: %s",
+                empty_log_message="Chat agent max-iteration synthesis returned no text",
+                context_limit=self.ITERATION_LIMIT_SYNTHESIS_CONTEXT_LIMIT,
+                item_limit=self.ITERATION_LIMIT_SYNTHESIS_ITEM_LIMIT,
+                message_item_limit=self.ITERATION_LIMIT_SYNTHESIS_ITEM_LIMIT,
+                message_tail_limit=self.ITERATION_LIMIT_SYNTHESIS_MESSAGE_LIMIT,
+                include_system_messages=False,
+                detailed_message_headers=True,
+                empty_message_text="(no text content)",
+                message_omitted_unit="conversation messages",
+                evidence_omitted_unit="tool result envelopes",
+            ),
+            messages=messages,
+            tool_envelopes=tool_envelopes,
+            guarded_invoke=guarded_ainvoke,
+            failure_response_factory=lambda: self._iteration_limit_failure_response(
+                iteration_count=iteration_count,
+                max_iterations=max_iterations,
+                messages=messages,
+                tool_envelopes=tool_envelopes,
+            ),
+            logger=logger,
+            human_prelude=f"Iteration budget: {iteration_count}/{max_iterations}",
+            format_exception=_format_exception_message,
+        )
+
+    def _build_workflow(
+        self,
+        tool_mgr: ToolManager,
+        emitter: Optional[ProgressEmitter] = None,
+    ) -> StateGraph:
+        """Build the LangGraph workflow for chat interactions.
+
+        Args:
+            tool_mgr: ToolManager instance for resolving tool calls
+            emitter: Optional progress emitter for status updates
+        """
+        # Mutable container for envelopes - expand_evidence references this
+        # so it can access envelopes as they're added by tool calls
+        envelopes_container: Dict[str, List[Dict[str, Any]]] = {"envelopes": []}
+        runtime_tools_by_generation: Dict[int, Dict[str, Any]] = {}
+
+        async def ensure_runtime_tools(
+            requested_generation: Optional[int] = None,
+        ) -> Dict[str, Any]:
+            current_generation = tool_mgr.get_toolset_generation()
+            generation = (
+                requested_generation if requested_generation is not None else current_generation
+            )
+            cached = runtime_tools_by_generation.get(generation)
+            if cached is not None:
+                return cached
+
+            if requested_generation is not None and requested_generation != current_generation:
+                logger.warning(
+                    "Requested chat tool generation %s is unavailable; using current generation %s",
+                    requested_generation,
+                    current_generation,
+                )
+                generation = current_generation
+                cached = runtime_tools_by_generation.get(generation)
+                if cached is not None:
+                    return cached
+
+            from .helpers import build_adapters_for_tooldefs as _build_adapters
+
+            # Reserve one slot for the local expand_evidence helper.
+            tooldefs = tool_mgr.get_tools_for_llm(max_tools=127)
+            adapters = await _build_adapters(tool_mgr, tooldefs)
+            expand_spec = self._build_expand_evidence_tool(envelopes_container)
+            expand_tool = StructuredTool.from_function(
+                func=expand_spec["func"],
+                name=expand_spec["name"],
+                description=expand_spec["description"],
+            )
+            all_adapters = list(adapters) + [expand_tool]
+            runtime = {
+                "generation": generation,
+                "tooldefs_by_name": {t.name: t for t in tooldefs},
+                "all_adapters": all_adapters,
+                "llm_with_expand": self.llm.bind_tools(all_adapters),
+                "local_tools": {expand_spec["name"]: expand_spec["func"]},
+            }
+            runtime_tools_by_generation[generation] = runtime
+            return runtime
+
+        async def agent_node(state: ChatAgentState) -> Dict[str, Any]:
+            """Main agent node - invokes LLM with tools."""
+            runtime = await ensure_runtime_tools()
+            tooldefs_by_name = runtime["tooldefs_by_name"]
+            messages = state["messages"]
+            iteration_count = state.get("iteration_count", 0)
+            startup_system_prompt = state.get("startup_system_prompt")
+            startup_prompt_initialized = state.get("startup_prompt_initialized", False)
+            signals_envelopes = list(state.get("signals_envelopes") or [])
+            skill_contract_repair_attempts = state.get("skill_contract_repair_attempts", 0)
+
+            if (
+                startup_system_prompt is None
+                and messages
+                and isinstance(messages[0], SystemMessage)
+            ):
+                startup_system_prompt = str(messages[0].content or "")
+                startup_prompt_initialized = True
+
+            if not messages or not isinstance(messages[0], SystemMessage):
+                if startup_system_prompt is None or (
+                    iteration_count == 0 and not startup_prompt_initialized
+                ):
+                    startup_context = await build_startup_knowledge_context(
+                        version="latest",
+                        available_tools=list(tooldefs_by_name.values()),
+                    )
+                    signals_envelopes = merge_internal_tool_envelopes(
+                        signals_envelopes,
+                        getattr(startup_context, "internal_tool_envelopes", []),
+                    )
+                    startup_system_prompt = (
+                        f"{startup_context}\n\n{CHAT_SYSTEM_PROMPT}"
+                        if startup_context.strip()
+                        else CHAT_SYSTEM_PROMPT
+                    )
+                    startup_prompt_initialized = True
+                startup_system_prompt = startup_system_prompt or CHAT_SYSTEM_PROMPT
+                messages = [SystemMessage(content=startup_system_prompt)] + messages
+
+            invoke_messages = list(messages)
+            state_contract_gaps = state.get("skill_contract_gaps")
+            skill_contract_gaps = (
+                list(state_contract_gaps)
+                if state_contract_gaps is not None
+                else _collect_skill_contract_gaps(
+                    signals_envelopes,
+                    state["messages"],
+                )
+            )
+            needs_output_repair = _skill_contract_gaps_need_followup(skill_contract_gaps)
+            repair_attempts_exhausted = needs_output_repair and not (
+                self._can_attempt_skill_contract_repair(state)
+            )
+            if repair_attempts_exhausted:
+                logger.warning(
+                    "Chat agent reached skill contract repair attempt limit (%s)",
+                    self.SKILL_CONTRACT_REPAIR_ATTEMPT_LIMIT,
+                )
+                return {
+                    "messages": list(state["messages"]),
+                    "iteration_count": iteration_count,
+                    "startup_system_prompt": startup_system_prompt,
+                    "startup_prompt_initialized": startup_prompt_initialized,
+                    "toolset_generation": runtime["generation"],
+                    "signals_envelopes": signals_envelopes,
+                    "skill_contract_repair_attempts": skill_contract_repair_attempts,
+                    "skill_contract_gaps": skill_contract_gaps,
+                    "current_tool_calls": [],
+                }
+            contract_repair_message = _build_skill_contract_repair_message(
+                signals_envelopes,
+                state["messages"],
+                gaps=skill_contract_gaps,
+            )
+            if contract_repair_message is not None:
+                invoke_messages.append(contract_repair_message)
+                if needs_output_repair:
+                    skill_contract_repair_attempts += 1
+
+            with tracer.start_as_current_span("chat_agent_node"):
+                response = await guarded_ainvoke(
+                    runtime["llm_with_expand"],
+                    invoke_messages,
+                    request_kind="chat_agent.agent_node",
+                )
+
+            # Persist only the original workflow state messages plus response.
+            # If we injected a SystemMessage just for this invocation, keep it ephemeral.
+            new_messages = list(state["messages"]) + [response]
+            response_contract_gaps = _collect_skill_contract_gaps(
+                signals_envelopes,
+                new_messages,
+            )
+            return {
+                "messages": new_messages,
+                "iteration_count": iteration_count + 1,
+                "startup_system_prompt": startup_system_prompt,
+                "startup_prompt_initialized": startup_prompt_initialized,
+                "toolset_generation": runtime["generation"],
+                "signals_envelopes": signals_envelopes,
+                "skill_contract_repair_attempts": skill_contract_repair_attempts,
+                "skill_contract_gaps": response_contract_gaps,
+                "current_tool_calls": response.tool_calls
+                if hasattr(response, "tool_calls")
+                else [],
+            }
+
+        async def tool_node(state: ChatAgentState) -> Dict[str, Any]:
+            """Execute tool calls from the agent."""
+            runtime = await ensure_runtime_tools(state.get("toolset_generation"))
+            tooldefs_by_name = runtime["tooldefs_by_name"]
+            messages = state["messages"]
+            envelopes = list(state.get("signals_envelopes") or [])
+
+            # Get pending tool calls from the last AI message
+            last_msg = messages[-1] if messages else None
+            tool_calls = []
+            if isinstance(last_msg, AIMessage) and hasattr(last_msg, "tool_calls"):
+                tool_calls = last_msg.tool_calls or []
+
+            # Emit progress updates for each tool call
+            if emitter and tool_calls:
+                for tc in tool_calls:
+                    tool_name = (
+                        tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    )
+                    tool_args = (
+                        tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                    ) or {}
+                    if tool_name:
+                        status_msg = self._tool_call_progress_message(
+                            tool_mgr, tool_name, tool_args
+                        )
+                        await emitter.emit(
+                            status_msg,
+                            "tool_call",
+                            metadata={"tool_name": tool_name, "tool_args": tool_args},
+                        )
+
+            with tracer.start_as_current_span("chat_tool_node"):
+                new_tool_messages = await execute_tool_calls_with_gate(
+                    tool_manager=tool_mgr,
+                    tool_calls=tool_calls,
+                    local_tools=runtime["local_tools"],
+                )
+
+                # Build envelopes and create summarized messages for the LLM
+                # The LLM sees summarized versions; full data stays in envelopes
+                messages_for_llm: List[ToolMessage] = []
+
+                for idx, tc in enumerate(tool_calls):
+                    tool_name = (
+                        tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    )
+                    tool_args = (
+                        tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                    ) or {}
+
+                    tm = new_tool_messages[idx] if idx < len(new_tool_messages) else None
+                    if tm is None:
+                        continue
+
+                    # Skip expand_evidence calls - pass through unchanged
+                    if tool_name == "expand_evidence":
+                        messages_for_llm.append(tm)
+                        continue
+
+                    env_dict = build_result_envelope(
+                        tool_name or f"tool_{idx + 1}", tool_args, tm, tooldefs_by_name
+                    )
+
+                    # Summarize envelope (preserves full data, adds summary field)
+                    env_dict = self._summarize_envelope_sync(env_dict)
+                    envelopes.append(env_dict)
+
+                    # Create summarized message for LLM if data is large
+                    tool_key = env_dict.get("tool_key", tool_name)
+                    data = env_dict.get("data", {})
+                    summarized_msg = self._create_summarized_tool_message(tm, tool_key, data)
+                    messages_for_llm.append(summarized_msg)
+
+                    # Log summarization for debugging
+                    orig_len = len(tm.content) if hasattr(tm, "content") else 0
+                    summ_len = (
+                        len(summarized_msg.content) if hasattr(summarized_msg, "content") else 0
+                    )
+                    if orig_len != summ_len:
+                        logger.debug(
+                            f"Summarized tool result: {tool_key} "
+                            f"({orig_len:,} -> {summ_len:,} chars)"
+                        )
+
+                # Update the mutable container so expand_evidence can see new envelopes
+                envelopes_container["envelopes"] = envelopes
+
+            return {
+                "messages": list(messages) + messages_for_llm,
+                "current_tool_calls": [],
+                "toolset_generation": runtime["generation"],
+                "signals_envelopes": envelopes,
+                "skill_contract_gaps": None,
+            }
+
+        def should_continue(state: ChatAgentState) -> str:
+            """Decide whether to continue with tools or end."""
+            messages = state["messages"]
+            iteration_count = state.get("iteration_count", 0)
+            max_iterations = state.get("max_iterations", 10)
+
+            if iteration_count >= max_iterations:
+                logger.warning(f"Chat agent reached max iterations ({max_iterations})")
+                return END
+
+            if messages and isinstance(messages[-1], AIMessage) and messages[-1].tool_calls:
+                return "tools"
+
+            if state.get("current_tool_calls"):
+                return "tools"
+
+            contract_gaps = state.get("skill_contract_gaps")
+            if contract_gaps is None:
+                contract_gaps = _collect_skill_contract_gaps(
+                    list(state.get("signals_envelopes") or []),
+                    messages,
+                )
+            if _skill_contract_gaps_need_followup(contract_gaps):
+                repair_attempts = state.get("skill_contract_repair_attempts", 0)
+                if not self._can_attempt_skill_contract_repair(
+                    {"skill_contract_repair_attempts": repair_attempts}
+                ):
+                    logger.warning(
+                        "Chat agent reached skill contract repair attempt limit (%s)",
+                        self.SKILL_CONTRACT_REPAIR_ATTEMPT_LIMIT,
+                    )
+                    return END
+                return "agent"
+
+            return END
+
+        workflow = StateGraph(ChatAgentState)
+        workflow.add_node("agent", agent_node)
+        workflow.add_node("tools", tool_node)
+        workflow.set_entry_point("agent")
+        workflow.add_conditional_edges(
+            "agent",
+            should_continue,
+            {"tools": "tools", "agent": "agent", END: END},
+        )
+        workflow.add_edge("tools", "agent")
+
+        return workflow
+
+    async def process_query(
+        self,
+        query: str,
+        session_id: str,
+        user_id: Optional[str],
+        max_iterations: int = 10,
+        context: Optional[Dict[str, Any]] = None,
+        progress_emitter: Optional[ProgressEmitter] = None,
+        conversation_history: Optional[List[BaseMessage]] = None,
+    ) -> AgentResponse:
+        """Process a query with quick tool access.
+
+        Args:
+            query: User's question
+            session_id: Session identifier
+            user_id: Optional user identifier
+            max_iterations: Maximum agent iterations (default 10)
+            context: Additional context (e.g., instance_id)
+            progress_emitter: Emitter for progress/notification updates
+            conversation_history: Optional previous messages for context
+
+        Returns:
+            AgentResponse with response text and any knowledge search results used
+        """
+        logger.info("Chat agent processing query for user %s", user_id or "<anonymous>")
+        normalized_context = dict(context or {})
+        raw_attached_target_handles = get_attached_target_handles_from_context(normalized_context)
+        turn_scope = TurnScope.from_context(
+            normalized_context,
+            thread_id=normalized_context.get("thread_id"),
+            session_id=session_id,
+        )
+        normalized_context.update(turn_scope.to_thread_context())
+        normalized_context["turn_scope"] = turn_scope.model_dump(mode="json")
+        attached_target_count = max(len(raw_attached_target_handles), turn_scope.target_count)
+        _get_attached_target_prompt = build_attached_target_prompt_loader(
+            lambda: normalized_context,
+            attached_target_count,
+            build_attached_target_scope_prompt,
+        )
+
+        # Use provided emitter, or fall back to instance emitter
+        emitter = progress_emitter if progress_emitter is not None else self._emitter
+        prepared_memory = await prepare_agent_turn_memory(
+            query=query,
+            session_id=session_id,
+            user_id=user_id,
+            context=normalized_context,
+            emitter=emitter,
+        )
+        memory_context = prepared_memory.memory_context
+
+        # Get cache client if tool caching is enabled
+        cache_client = None
+        if settings.tool_cache_enabled and self.redis_instance:
+            cache_client = get_redis_client()
+            logger.info(f"Tool caching enabled for instance {self.redis_instance.id}")
+
+        support_package_path = self.support_package_path
+        scope_support_package_path = turn_scope.support_package_context.get("support_package_path")
+        if support_package_path is None and scope_support_package_path:
+            support_package_path = Path(scope_support_package_path)
+
+        has_attached_scope = (
+            turn_scope.scope_kind == "target_bindings" and turn_scope.target_count > 0
+        )
+        effective_redis_instance = None if has_attached_scope else self.redis_instance
+        effective_redis_cluster = None if has_attached_scope else self.redis_cluster
+
+        # Create ToolManager with Redis instance for full tool access
+        tool_thread_id = turn_scope.thread_id or session_id
+        async with ToolManager(
+            redis_instance=effective_redis_instance,
+            redis_cluster=effective_redis_cluster,
+            initial_target_bindings=turn_scope.bindings or None,
+            initial_toolset_generation=turn_scope.toolset_generation,
+            exclude_mcp_categories=self.exclude_mcp_categories,
+            support_package_path=support_package_path,
+            cache_client=cache_client,
+            cache_ttl_overrides=settings.tool_cache_ttl_overrides or None,
+            thread_id=tool_thread_id,
+            task_id=normalized_context.get("task_id"),
+            user_id=user_id,
+            graph_type="chat",
+        ) as tool_mgr:
+            tools = tool_mgr.get_tools()
+            logger.info(f"Chat agent loaded {len(tools)} tools")
+            workflow = self._build_workflow(tool_mgr, emitter)
+            task_id = normalized_context.get("task_id")
+            graph_thread_id = resolve_graph_thread_id(
+                session_id=session_id,
+                context=normalized_context,
+            )
+
+            # Build initial messages with shared startup context (pinned docs, skills, tool usage)
+            startup_context = await build_startup_knowledge_context(
+                version="latest",
+                available_tools=tools,
+            )
+            system_prompt = (
+                f"{startup_context}\n\n{CHAT_SYSTEM_PROMPT}"
+                if startup_context.strip()
+                else CHAT_SYSTEM_PROMPT
+            )
+            initial_messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
+            if memory_context.system_prompt:
+                initial_messages.append(SystemMessage(content=memory_context.system_prompt))
+
+            # Add instance context to the query if available
+            enhanced_query = query
+            attached_prompt_query: Optional[str] = None
+            attached_prompt_scope = attached_target_count > 1 or has_attached_scope
+            if attached_prompt_scope:
+                prompt = await _get_attached_target_prompt()
+                if not prompt:
+                    prompt = build_attached_target_prompt_fallback(
+                        attached_target_count=attached_target_count,
+                        bindings=turn_scope.bindings,
+                        attached_handles=raw_attached_target_handles,
+                    )
+                if not prompt and has_attached_scope and turn_scope.single_binding is not None:
+                    prompt = build_single_attached_binding_prompt(turn_scope.single_binding)
+                if prompt:
+                    attached_prompt_query = f"""{prompt}
+
+User Query: {query}"""
+            if attached_prompt_query:
+                enhanced_query = attached_prompt_query
+            elif effective_redis_instance:
+                repo_context = ""
+                if effective_redis_instance.repo_url:
+                    repo_context = f"""- Repository URL: {effective_redis_instance.repo_url}
+
+If you have GitHub tools available, you can search the repository for code, configuration, or documentation related to this Redis instance.
+"""
+                instance_context = f"""
+INSTANCE CONTEXT: This query is about Redis instance:
+- Instance Name: {effective_redis_instance.name}
+- Environment: {effective_redis_instance.environment}
+- Usage: {effective_redis_instance.usage}
+- Instance Type: {effective_redis_instance.instance_type}
+{repo_context}
+Your diagnostic tools are PRE-CONFIGURED for this instance.
+
+User Query: {query}"""
+                enhanced_query = instance_context
+            elif effective_redis_cluster:
+                cluster_context = f"""
+CLUSTER CONTEXT: This query is about Redis cluster:
+- Cluster Name: {effective_redis_cluster.name}
+- Cluster ID: {effective_redis_cluster.id}
+- Environment: {effective_redis_cluster.environment}
+- Cluster Type: {effective_redis_cluster.cluster_type}
+
+Cluster-level admin tools are PRE-CONFIGURED for this cluster when available.
+
+User Query: {query}"""
+                enhanced_query = cluster_context
+            else:
+                prompt = None
+                if not attached_prompt_scope:
+                    prompt = await _get_attached_target_prompt()
+                if prompt:
+                    enhanced_query = f"""{prompt}
+
+User Query: {query}"""
+
+            if conversation_history:
+                initial_messages.extend(conversation_history)
+
+            initial_messages.append(HumanMessage(content=enhanced_query))
+
+            initial_generation = tool_mgr.get_toolset_generation()
+            initial_state: ChatAgentState = {
+                "messages": initial_messages,
+                "session_id": session_id,
+                "user_id": user_id,
+                "current_tool_calls": [],
+                "iteration_count": 0,
+                "max_iterations": max_iterations,
+                "startup_system_prompt": system_prompt,
+                "startup_prompt_initialized": True,
+                "toolset_generation": initial_generation,
+                "skill_contract_repair_attempts": 0,
+                "signals_envelopes": merge_internal_tool_envelopes(
+                    [],
+                    getattr(startup_context, "internal_tool_envelopes", []),
+                ),
+            }
+
+            thread_config = build_graph_config(graph_thread_id=graph_thread_id)
+
+            try:
+                await emitter.emit("Chat agent processing your question...", "agent_start")
+                async with open_graph_checkpointer(durable=bool(task_id)) as checkpointer:
+                    app = workflow.compile(checkpointer=checkpointer)
+                    final_state = await app.ainvoke(initial_state, config=thread_config)
+                    await persist_checkpoint_metadata(
+                        task_id=task_id,
+                        thread_id=tool_thread_id,
+                        graph_thread_id=graph_thread_id,
+                        graph_type="chat",
+                        checkpointer=checkpointer,
+                        config=thread_config,
+                    )
+                    if final_state.get("__interrupt__"):
+                        await persist_approval_wait_state(task_id=task_id)
+                        raise GraphInterrupt(tuple(final_state["__interrupt__"]))
+
+                    tool_envelopes = final_state.get("signals_envelopes", [])
+
+                    messages = final_state.get("messages", [])
+                    response_text = extract_last_ai_response(messages, terminal_only=True)
+                    if response_text:
+                        response_text = await self._repair_final_response_to_skill_contract(
+                            response_text=response_text,
+                            tool_envelopes=tool_envelopes,
+                            messages=messages,
+                            final_state=final_state,
+                        )
+                        response = AgentResponse(
+                            response=response_text,
+                            tool_envelopes=tool_envelopes,
+                        )
+                        await prepared_memory.persist_response_fail_open(response.response)
+                        return response
+
+                    if self._reached_iteration_limit(final_state, max_iterations):
+                        iteration_count = final_state.get("iteration_count", max_iterations)
+                        state_max_iterations = final_state.get("max_iterations", max_iterations)
+                        if not isinstance(iteration_count, int):
+                            iteration_count = max_iterations
+                        if not isinstance(state_max_iterations, int):
+                            state_max_iterations = max_iterations
+                        response_text = await self._synthesize_iteration_limit_response(
+                            messages=messages,
+                            tool_envelopes=tool_envelopes,
+                            iteration_count=iteration_count,
+                            max_iterations=state_max_iterations,
+                        )
+                        response = AgentResponse(
+                            response=response_text,
+                            tool_envelopes=tool_envelopes,
+                        )
+                        await prepared_memory.persist_response_fail_open(response.response)
+                        return response
+
+                    fallback = AgentResponse(
+                        response="I couldn't process that query. Please try rephrasing.",
+                    )
+                    return fallback
+
+            except GraphInterrupt:
+                raise
+            except Exception as e:
+                error_message = _format_exception_message(e)
+                logger.exception("Chat agent error: %s", error_message)
+                return AgentResponse(response=f"Error processing query: {error_message}")
+
+    async def resume_query(
+        self,
+        *,
+        session_id: str,
+        user_id: Optional[str],
+        context: Optional[Dict[str, Any]] = None,
+        progress_emitter: Optional[ProgressEmitter] = None,
+        resume_payload: Optional[Dict[str, Any]] = None,
+    ) -> AgentResponse:
+        """Resume a paused chat graph from its persisted checkpoint."""
+
+        normalized_context = dict(context or {})
+        turn_scope = TurnScope.from_context(
+            normalized_context,
+            thread_id=normalized_context.get("thread_id"),
+            session_id=session_id,
+        )
+        normalized_context.update(turn_scope.to_thread_context())
+        normalized_context["turn_scope"] = turn_scope.model_dump(mode="json")
+
+        emitter = progress_emitter if progress_emitter is not None else self._emitter
+        cache_client = None
+        if settings.tool_cache_enabled and self.redis_instance:
+            cache_client = get_redis_client()
+
+        support_package_path = self.support_package_path
+        scope_support_package_path = turn_scope.support_package_context.get("support_package_path")
+        if support_package_path is None and scope_support_package_path:
+            support_package_path = Path(scope_support_package_path)
+
+        has_attached_scope = (
+            turn_scope.scope_kind == "target_bindings" and turn_scope.target_count > 0
+        )
+        effective_redis_instance = None if has_attached_scope else self.redis_instance
+        effective_redis_cluster = None if has_attached_scope else self.redis_cluster
+
+        tool_thread_id = turn_scope.thread_id or session_id
+        async with ToolManager(
+            redis_instance=effective_redis_instance,
+            redis_cluster=effective_redis_cluster,
+            initial_target_bindings=turn_scope.bindings or None,
+            initial_toolset_generation=turn_scope.toolset_generation,
+            exclude_mcp_categories=self.exclude_mcp_categories,
+            support_package_path=support_package_path,
+            cache_client=cache_client,
+            cache_ttl_overrides=settings.tool_cache_ttl_overrides or None,
+            thread_id=tool_thread_id,
+            task_id=normalized_context.get("task_id"),
+            user_id=user_id,
+            graph_type="chat",
+        ) as tool_mgr:
+            workflow = self._build_workflow(tool_mgr, emitter)
+            task_id = normalized_context.get("task_id")
+            graph_thread_id = resolve_graph_thread_id(
+                session_id=session_id,
+                context=normalized_context,
+            )
+            thread_config = build_graph_config(graph_thread_id=graph_thread_id)
+
+            try:
+                async with open_graph_checkpointer(durable=True) as checkpointer:
+                    app = workflow.compile(checkpointer=checkpointer)
+                    final_state = await app.ainvoke(
+                        Command(resume=resume_payload or {}),
+                        config=thread_config,
+                    )
+                    await persist_checkpoint_metadata(
+                        task_id=task_id,
+                        thread_id=tool_thread_id,
+                        graph_thread_id=graph_thread_id,
+                        graph_type="chat",
+                        checkpointer=checkpointer,
+                        config=thread_config,
+                    )
+                    if final_state.get("__interrupt__"):
+                        await persist_approval_wait_state(task_id=task_id)
+                        raise GraphInterrupt(tuple(final_state["__interrupt__"]))
+
+                    tool_envelopes = final_state.get("signals_envelopes", [])
+                    messages = final_state.get("messages", [])
+                    response_text = extract_last_ai_response(messages, terminal_only=True)
+                    if response_text:
+                        response_text = await self._repair_final_response_to_skill_contract(
+                            response_text=response_text,
+                            tool_envelopes=tool_envelopes,
+                            messages=messages,
+                            final_state=final_state,
+                        )
+                        return AgentResponse(
+                            response=response_text,
+                            tool_envelopes=tool_envelopes,
+                        )
+
+                    return AgentResponse(
+                        response="I couldn't resume that query. Please try again.",
+                    )
+            except GraphInterrupt:
+                raise
+            except Exception as e:
+                error_message = _format_exception_message(e)
+                logger.exception("Chat agent resume error: %s", error_message)
+                return AgentResponse(response=f"Error resuming query: {error_message}")
+
+
+# Singleton cache keyed by instance name
+_chat_agents: Dict[str, ChatAgent] = {}
+
+
+def get_chat_agent(
+    redis_instance: Optional[RedisInstance] = None,
+    redis_cluster: Optional[RedisCluster] = None,
+) -> ChatAgent:
+    """Get or create a chat agent, optionally for a specific Redis instance.
+
+    Args:
+        redis_instance: Optional Redis instance for context
+        redis_cluster: Optional Redis cluster for cluster-scoped context
+
+    Returns:
+        ChatAgent instance
+    """
+    global _chat_agents
+    if redis_instance and redis_cluster:
+        key = f"instance:{redis_instance.id}|cluster:{redis_cluster.id}"
+    elif redis_instance:
+        key = f"instance:{redis_instance.id}"
+    elif redis_cluster:
+        key = f"cluster:{redis_cluster.id}"
+    else:
+        key = "__no_instance__"
+
+    if key not in _chat_agents:
+        _chat_agents[key] = ChatAgent(
+            redis_instance=redis_instance,
+            redis_cluster=redis_cluster,
+        )
+
+    return _chat_agents[key]

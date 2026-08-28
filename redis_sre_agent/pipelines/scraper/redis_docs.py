@@ -1,0 +1,530 @@
+"""Redis documentation scraper for OSS and Enterprise docs."""
+
+import asyncio
+import logging
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import aiohttp
+from bs4 import BeautifulSoup
+
+from .base import (
+    ArtifactStorage,
+    BaseScraper,
+    DocumentCategory,
+    DocumentType,
+    ScrapedDocument,
+    SeverityLevel,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class RedisDocsScraper(BaseScraper):
+    """Scraper for Redis documentation sites."""
+
+    def __init__(self, storage: ArtifactStorage, config: Optional[Dict[str, Any]] = None):
+        super().__init__(storage, config)
+
+        # Default configuration
+        self.config = {
+            "oss_base_url": "https://redis.io/docs/",
+            "enterprise_base_url": "https://docs.redis.com/latest/",
+            "max_pages": 500,  # Increased for comprehensive scraping
+            "delay_between_requests": 0.5,  # Faster but still respectful
+            "timeout": 30,
+            "latest_only": False,  # If True, skip versioned docs (e.g., /7.x/)
+            **self.config,
+        }
+
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._visited_urls: Set[str] = set()
+        self._pages_scraped = 0
+        self._progress_interval = max(1, int(self.config.get("progress_interval", 10)))
+
+    def _is_versioned_url(self, url: str) -> bool:
+        """Return True if URL path contains a version segment like /7.4/ or /6.2/."""
+        try:
+            import re
+            from urllib.parse import urlparse
+
+            path = urlparse(url).path
+            return bool(re.search(r"/\d+\.\d+/", path))
+        except Exception:
+            return False
+
+    def _extract_version_from_url(self, url: str) -> str:
+        """Extract version from URL path.
+
+        Examples:
+            /rs/7.8/clusters/... -> "7.8"
+            /rs/7.4/clusters/... -> "7.4"
+            /rs/clusters/... -> "latest"
+            /latest/operate/... -> "latest"
+
+        Returns:
+            Version string (e.g., "7.8", "7.4") or "latest" for unversioned docs.
+        """
+        import re
+        from urllib.parse import urlparse
+
+        try:
+            path = urlparse(url).path
+            # Match version patterns like /7.8/, /7.4/, /6.2/
+            match = re.search(r"/(\d+\.\d+)/", path)
+            if match:
+                return match.group(1)
+            return "latest"
+        except Exception:
+            return "latest"
+
+    def get_source_name(self) -> str:
+        return "redis_documentation"
+
+    async def scrape(self) -> List[ScrapedDocument]:
+        """Scrape Redis OSS and Enterprise documentation."""
+        documents = []
+        self._visited_urls = set()
+        self._pages_scraped = 0
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config["timeout"])
+        ) as session:
+            self.session = session
+
+            # Scrape OSS documentation
+            self.logger.info("Scraping Redis OSS documentation")
+            oss_docs = await self._scrape_oss_docs()
+            documents.extend(oss_docs)
+
+            # Scrape Enterprise documentation
+            self.logger.info("Scraping Redis Enterprise documentation")
+            enterprise_docs = await self._scrape_enterprise_docs()
+            documents.extend(enterprise_docs)
+
+        self.logger.info(f"Scraped {len(documents)} Redis documentation pages")
+        return documents
+
+    def _normalize_url(self, url: str) -> str:
+        """Normalize documentation URLs so revisits collapse to a single page."""
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip("/") or "/"
+        return urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                normalized_path,
+                parsed.params,
+                "",
+                "",
+            )
+        )
+
+    async def _scrape_oss_docs(self) -> List[ScrapedDocument]:
+        """Scrape Redis OSS documentation."""
+        base_url = self.config["oss_base_url"]
+        documents = []
+
+        # Comprehensive OSS documentation sections
+        oss_sections = [
+            ("get-started/", DocumentType.TUTORIAL, SeverityLevel.HIGH),
+            ("connect/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
+            ("data-types/", DocumentType.REFERENCE, SeverityLevel.MEDIUM),
+            ("commands/", DocumentType.REFERENCE, SeverityLevel.MEDIUM),
+            ("management/", DocumentType.RUNBOOK, SeverityLevel.HIGH),
+            ("operate/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
+            ("latest/operate/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
+            # Redis Enterprise Software CLI utilities (rladmin, redis-cli, etc.)
+            (
+                "latest/operate/rs/references/cli-utilities/",
+                DocumentType.REFERENCE,
+                SeverityLevel.CRITICAL,
+            ),
+            # Redis Enterprise Software operations
+            ("latest/operate/rs/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
+            # Deep technical sections
+            ("latest/operate/oss_and_stack/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
+            (
+                "latest/operate/oss_and_stack/stack-with-enterprise/",
+                DocumentType.RUNBOOK,
+                SeverityLevel.CRITICAL,
+            ),
+            (
+                "latest/operate/oss_and_stack/stack-with-enterprise/search/",
+                DocumentType.REFERENCE,
+                SeverityLevel.HIGH,
+            ),
+            (
+                "latest/operate/oss_and_stack/stack-with-enterprise/json/",
+                DocumentType.REFERENCE,
+                SeverityLevel.HIGH,
+            ),
+            (
+                "latest/operate/oss_and_stack/stack-with-enterprise/timeseries/",
+                DocumentType.REFERENCE,
+                SeverityLevel.MEDIUM,
+            ),
+            (
+                "latest/operate/oss_and_stack/stack-with-enterprise/bloom/",
+                DocumentType.REFERENCE,
+                SeverityLevel.MEDIUM,
+            ),
+            (
+                "latest/operate/oss_and_stack/stack-with-enterprise/graph/",
+                DocumentType.REFERENCE,
+                SeverityLevel.MEDIUM,
+            ),
+            ("latest/operate/oss_and_stack/management/", DocumentType.RUNBOOK, SeverityLevel.HIGH),
+            (
+                "latest/operate/oss_and_stack/management/admin/",
+                DocumentType.RUNBOOK,
+                SeverityLevel.CRITICAL,
+            ),
+            (
+                "latest/operate/oss_and_stack/management/config/",
+                DocumentType.RUNBOOK,
+                SeverityLevel.CRITICAL,
+            ),
+            (
+                "latest/operate/oss_and_stack/management/optimization/",
+                DocumentType.RUNBOOK,
+                SeverityLevel.HIGH,
+            ),
+            (
+                "latest/operate/oss_and_stack/management/security/",
+                DocumentType.RUNBOOK,
+                SeverityLevel.CRITICAL,
+            ),
+            ("latest/integrate/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
+            ("latest/develop/", DocumentType.DOCUMENTATION, SeverityLevel.MEDIUM),
+        ]
+
+        for section, doc_type, severity in oss_sections:
+            section_url = urljoin(base_url, section)
+
+            # If latest_only is set, skip section URLs that look versioned
+            if self.config.get("latest_only") and self._is_versioned_url(section_url):
+                continue
+
+            try:
+                section_docs = await self._scrape_section(
+                    section_url, DocumentCategory.OSS, doc_type, severity, max_depth=4
+                )
+                documents.extend(section_docs)
+
+                # Rate limiting
+                await asyncio.sleep(self.config["delay_between_requests"])
+
+            except Exception as e:
+                self.logger.error(f"Failed to scrape OSS section {section}: {e}")
+                continue
+
+        return documents
+
+    async def _scrape_enterprise_docs(self) -> List[ScrapedDocument]:
+        """Scrape Redis Enterprise documentation."""
+        base_url = self.config["enterprise_base_url"]
+        documents = []
+
+        # Key Enterprise documentation sections
+        enterprise_sections = [
+            ("rs/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
+            ("rc/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
+            ("ri/", DocumentType.DOCUMENTATION, SeverityLevel.MEDIUM),
+            ("kubernetes/", DocumentType.RUNBOOK, SeverityLevel.HIGH),
+            ("modules/", DocumentType.REFERENCE, SeverityLevel.MEDIUM),
+        ]
+
+        for section, doc_type, severity in enterprise_sections:
+            section_url = urljoin(base_url, section)
+
+            # For enterprise, base_url already uses /latest/, but still guard
+            if self.config.get("latest_only") and self._is_versioned_url(section_url):
+                continue
+
+            try:
+                section_docs = await self._scrape_section(
+                    section_url, DocumentCategory.ENTERPRISE, doc_type, severity, max_depth=4
+                )
+                documents.extend(section_docs)
+
+                # Rate limiting
+                await asyncio.sleep(self.config["delay_between_requests"])
+
+            except Exception as e:
+                self.logger.error(f"Failed to scrape Enterprise section {section}: {e}")
+                continue
+
+        return documents
+
+    async def _scrape_section(
+        self,
+        section_url: str,
+        category: DocumentCategory,
+        doc_type: DocumentType,
+        severity: SeverityLevel,
+        max_depth: int = 2,
+        current_depth: int = 0,
+    ) -> List[ScrapedDocument]:
+        """Recursively scrape a documentation section."""
+        if current_depth >= max_depth:
+            return []
+
+        normalized_url = self._normalize_url(section_url)
+
+        if normalized_url in self._visited_urls:
+            return []
+
+        if self._pages_scraped >= self.config["max_pages"]:
+            return []
+
+        documents = []
+
+        try:
+            # Respect latest-only: skip versioned URLs outright
+            if self.config.get("latest_only") and self._is_versioned_url(normalized_url):
+                return []
+
+            self._visited_urls.add(normalized_url)
+            self._pages_scraped += 1
+
+            if self._pages_scraped == 1 or self._pages_scraped % self._progress_interval == 0:
+                await self.emit_progress(
+                    f"Scraped {self._pages_scraped} Redis docs pages",
+                    "pipeline_scrape_progress",
+                    {
+                        "pages_scraped": self._pages_scraped,
+                        "max_pages": self.config["max_pages"],
+                        "current_url": normalized_url,
+                        "current_depth": current_depth,
+                    },
+                )
+
+            # Get section page
+            async with self.session.get(normalized_url) as response:
+                if response.status != 200:
+                    self.logger.warning(f"HTTP {response.status} for {normalized_url}")
+                    return []
+
+                html = await response.text()
+                soup = BeautifulSoup(html, "html.parser")
+
+            # Extract main content
+            main_content = await self._extract_page_content(soup, normalized_url)
+            if main_content:
+                # Extract version from URL and add to metadata
+                version = self._extract_version_from_url(normalized_url)
+                metadata = {
+                    **main_content["metadata"],
+                    "version": version,
+                }
+                doc = ScrapedDocument(
+                    title=main_content["title"],
+                    content=main_content["content"],
+                    source_url=normalized_url,
+                    category=category,
+                    doc_type=doc_type,
+                    severity=severity,
+                    metadata=metadata,
+                )
+                documents.append(doc)
+
+            # Find links to sub-pages (if not at max depth)
+            if current_depth < max_depth - 1:
+                links = await self._find_documentation_links(soup, normalized_url)
+                filtered_links = [
+                    link_url
+                    for link_url in links
+                    if self._normalize_url(link_url) not in self._visited_urls
+                ]
+
+                for link_url in filtered_links[:50]:  # Increased limit for comprehensive scraping
+                    try:
+                        subdocs = await self._scrape_section(
+                            link_url, category, doc_type, severity, max_depth, current_depth + 1
+                        )
+                        documents.extend(subdocs)
+
+                        # Rate limiting for sub-pages
+                        await asyncio.sleep(0.5)
+
+                    except Exception as e:
+                        self.logger.error(f"Failed to scrape sub-page {link_url}: {e}")
+                        continue
+
+        except Exception as e:
+            self.logger.error(f"Failed to scrape section {normalized_url}: {e}")
+
+        return documents
+
+    async def _extract_page_content(
+        self, soup: BeautifulSoup, url: str
+    ) -> Optional[Dict[str, Any]]:
+        """Extract title, content, and metadata from a documentation page.
+
+        Phase 0 improvement: include code/pre blocks (examples) inline so LLMs see full examples.
+        """
+        try:
+            # Extract title
+            title = None
+            title_selectors = ["h1", "title", ".page-title", "#title"]
+
+            for selector in title_selectors:
+                title_elem = soup.select_one(selector)
+                if title_elem:
+                    title = title_elem.get_text().strip()
+                    break
+
+            if not title:
+                title = f"Redis Documentation - {urlparse(url).path}"
+
+            # Extract main content
+            content = ""
+            content_selectors = [
+                "main",
+                ".content",
+                ".main-content",
+                ".documentation-content",
+                "#content",
+                "article",
+                ".article-content",
+            ]
+
+            for selector in content_selectors:
+                content_elem = soup.select_one(selector)
+                if content_elem:
+                    content = content_elem.get_text().strip()
+                    break
+
+            # Fallback to body if no content found
+            if not content:
+                body = soup.select_one("body")
+                if body:
+                    content = body.get_text().strip()
+
+            # Append code/pre blocks as fenced sections to preserve examples
+            try:
+                code_blocks = []
+                for pre in soup.find_all("pre"):
+                    code_text = pre.get_text("\n").strip()
+                    if code_text:
+                        code_blocks.append(f"```\n{code_text}\n```")
+                # Some sites wrap JSON in <code> without <pre>
+                for code in soup.find_all("code"):
+                    # Skip tiny inline code snippets; keep substantial examples
+                    code_text = code.get_text("\n").strip()
+                    if code_text and len(code_text) > 80:
+                        code_blocks.append(f"```\n{code_text}\n```")
+                if code_blocks:
+                    content = f"{content}\n\n## Examples\n\n" + "\n\n".join(code_blocks)
+            except Exception:
+                # Never fail scraping due to code block parsing
+                pass
+
+            # Clean content
+            content = self._clean_content(content)
+
+            if len(content) < 100:  # Skip very short pages
+                return None
+
+            # Extract metadata
+            metadata = {
+                "url": url,
+                "scraped_from": "redis_docs_scraper",
+                "content_length": len(content),
+                "has_code_examples": bool(soup.find("code") or soup.find("pre")),
+                "section": self._extract_section_from_url(url),
+            }
+
+            # Try to extract description/summary
+            description_elem = soup.select_one('meta[name="description"]')
+            if description_elem:
+                metadata["description"] = description_elem.get("content", "")
+
+            return {"title": title, "content": content, "metadata": metadata}
+
+        except Exception as e:
+            self.logger.error(f"Failed to extract content from {url}: {e}")
+            return None
+
+    async def _find_documentation_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
+        """Find links to other documentation pages on the same site."""
+        links = []
+        base_domain = urlparse(base_url).netloc
+
+        # Find all links
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+
+            # Convert relative URLs to absolute
+            raw_full_url = urljoin(base_url, href)
+            parsed = urlparse(raw_full_url)
+
+            # Only include links from the same domain
+            if parsed.netloc == base_domain:
+                # Exclude non-documentation links
+                if any(
+                    exclude in raw_full_url
+                    for exclude in [
+                        "#",
+                        "javascript:",
+                        "mailto:",
+                        ".pdf",
+                        ".zip",
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".svg",
+                        ".webp",
+                        "/images/",
+                        "/download",
+                        "/blog",
+                        "/community",
+                        "?search=",  # Changed from /search to avoid excluding search docs
+                    ]
+                ):
+                    continue
+
+                full_url = self._normalize_url(raw_full_url)
+
+                # latest-only: skip versioned URLs
+                if self.config.get("latest_only") and self._is_versioned_url(full_url):
+                    continue
+
+                # Include documentation paths specifically
+                if (
+                    any(
+                        include in full_url
+                        for include in [
+                            "/docs/",
+                            "/operate/",
+                            "/develop/",
+                            "/integrate/",
+                            "/commands/",
+                            "/data-types/",
+                            "/management/",
+                            "/stack-with-enterprise/",
+                            "/search/",
+                            "/json/",
+                            "/timeseries/",
+                            "/bloom/",
+                            "/graph/",
+                            "/admin/",
+                            "/config/",
+                            "/optimization/",
+                            "/security/",
+                        ]
+                    )
+                    and full_url not in links
+                    and full_url != base_url
+                ):
+                    links.append(full_url)
+
+        return links[:100]  # Increased limit for comprehensive documentation
+
+    def _extract_section_from_url(self, url: str) -> str:
+        """Extract section name from URL path."""
+        path = urlparse(url).path
+        parts = [p for p in path.split("/") if p and p != "docs"]
+        return parts[0] if parts else "general"

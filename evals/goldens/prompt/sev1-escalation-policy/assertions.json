@@ -1,0 +1,11 @@
+{
+  "required_findings": [
+    "escalate immediately",
+    "page the incident commander"
+  ],
+  "forbidden_claims": [
+    "wait until tomorrow",
+    "wait until business hours"
+  ],
+  "required_response_patterns": []
+}

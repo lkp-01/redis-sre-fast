@@ -1,0 +1,10 @@
+{
+  "required_tool_calls": [],
+  "forbidden_tool_calls": [],
+  "required_response_patterns": [],
+  "required_findings": [],
+  "forbidden_claims": [],
+  "required_sources": [
+    "redis-enterprise-maintenance-checklist"
+  ]
+}
