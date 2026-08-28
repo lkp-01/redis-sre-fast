@@ -16,9 +16,7 @@ logger = logging.getLogger(__name__)
 
 CATEGORY_NAME_MAP = {
     "oss": DocumentCategory.OSS,
-    "enterprise": DocumentCategory.ENTERPRISE,
     "shared": DocumentCategory.SHARED,
-    "cloud": DocumentCategory.SHARED,
 }
 
 SEVERITY_NAME_MAP = {

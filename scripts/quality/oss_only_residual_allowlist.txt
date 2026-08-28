@@ -1,0 +1,14 @@
+# Legacy strings deliberately retained to test historical-data rejection.
+scripts/migrations/
+tests/migrations/
+tests/core/test_persisted_load_errors.py
+tests/core/test_supported_target_types.py
+tests/core/test_target_catalog_oss_only.py
+tests/core/test_turn_scope_oss_only.py
+tests/agent/test_router_oss_only.py
+tests/api/test_oss_only_boundaries.py
+tests/quality/test_oss_only_residuals.py
+
+# The product-scope policy requires this exact sentence in both agent prompts.
+redis_sre_agent/agent/prompts.py:14
+redis_sre_agent/agent/chat_agent.py:299

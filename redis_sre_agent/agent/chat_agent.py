@@ -10,8 +10,7 @@ or safety-evaluation chains.
 import json
 import logging
 import re
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
@@ -45,9 +44,6 @@ from redis_sre_agent.skills.contracts import (
 )
 from redis_sre_agent.tools.manager import ToolManager
 from redis_sre_agent.tools.models import ToolCapability
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 from .checkpointing import (
     build_graph_config,
@@ -298,99 +294,17 @@ def _format_exception_message(exc: Exception) -> str:
     return type(exc).__name__
 
 
-CHAT_SYSTEM_PROMPT = f"""You are a Redis SRE agent with access to tools for investigating Redis deployments.
+CHAT_SYSTEM_PROMPT = f"""You are a Redis SRE agent investigating standard Redis protocol endpoints.
 
-## Your Approach - ITERATIVE INVESTIGATION
+This agent diagnoses standard Redis standalone and Redis Cluster protocol endpoints only. It does not use vendor management APIs or offline support packages.
 
-Work step by step. Don't try to gather all information at once.
+Work iteratively: make a few targeted read-only calls, assess the evidence, then either answer or gather the next most useful evidence. Do not make live-state claims until an exact target is attached.
 
-1. **Make a few targeted tool calls** (2-4 max per turn)
-2. **Analyze the results** - think about what you learned
-3. **Decide what to do next** - either answer or make more targeted calls
-4. **Repeat** until you have enough information to answer
+For clusters, use evidence from `INFO`, `CLUSTER INFO`, `CLUSTER NODES`, `CLUSTER SLOTS`, and replication information. A seed endpoint may not describe every node, so state that boundary clearly.
 
-This iterative approach prevents overwhelming context limits and produces better analysis.
-
-## Tool Calling Guidelines
-
-**Per turn, call at most 3-4 tools.** Analyze results before calling more.
-
-For Redis diagnostics:
-- Start with diagnostics-category tools for a comprehensive overview
-- Add diagnostics/admin-api category tools for Redis Enterprise/Cloud configuration details
-- Add knowledge-category tools when you need troubleshooting guidance
-- For Redis Enterprise CRDB/Active-Active questions, do not decide from `get_database`
-  alone. Call the available CRDB admin-api tools first: `list_crdbs` to confirm
-  CRDB identity/topology, then `get_crdb`, `get_crdb_health_report`,
-  `get_crdt_syncer_state`, `get_sync_source_stats`, and `get_logs` as needed for
-  peers/sites, link status, syncer state, lag, and recent CRDB/CRDT/resync events.
-  Match CRDBs by CRDB name, CRDB GUID, local BDB UID, or instance DB UID. Do not
-  declare a database "not CRDB" solely because optional CRDT fields are absent
-  from a BDB response. If multiple CRDBs match the requested name or UID, ask for
-  clarification instead of choosing one. If `list_crdbs` returns no matches, say
-  no CRDB was found only after reporting that CRDB inventory check.
-
-For code/repo investigation:
-- **First:** One targeted repos-category search with a specific query
-- **Analyze:** Look at search results, identify the most relevant file
-- **Then:** Fetch one relevant file from repos-category tools
-- **Repeat:** If needed, fetch another file based on what you learned
-
-For metrics/logs:
-- Be specific with queries - broad queries return too much data
-- Fetch one metric or log query at a time
-
-For target discovery:
-- If the user asks what Redis targets you know about, call `list_known_redis_targets`
-- If the user describes a target but has not given `instance_id` or `cluster_id`, call `resolve_redis_targets` before making live-state claims
-- Only treat target discovery as confirmed when it returns an exact live match. If the match is fuzzy, partial, or ambiguous, ask the user to confirm the target before you attach tools or describe live state
-- If the user asks to compare or investigate multiple targets, call `resolve_redis_targets` with `allow_multiple=true`, keep the attached target set, and gather evidence per target before comparing
-- If target discovery returns `status="too_many_matches"`, do not attach or inspect a partial target set. Say there are too many Redis targets, ask the user to narrow the request to the reported `max_selectable` target count, and include "5 or fewer targets" when `max_selectable` is 5
-- If the user asks both "what do you know about?" and asks to drill into one target in the same turn, list first, then resolve the chosen target and continue with the attached live tools
-- A hostname or hostname fragment is not enough to assume a live Redis target. If target discovery does not return an exact live match, do not attach or describe a different Redis deployment as if it were that hostname
-
-For historical incident context (if `tickets` tools are available):
-- Use tickets tools instead of general knowledge search because general knowledge search excludes support tickets
-- Search support tickets with concrete identifiers (cluster name/host, error strings)
-- Fetch the most relevant ticket record for full details
-
-For skills, runbooks, and evidence-backed workflows:
-- A skill name shown in startup context is inventory only, not proof that you retrieved or executed that skill
-- If a listed or requested skill is relevant, fetch it with `get_skill` before claiming you followed it or improvising the workflow from memory
-- Do not say you "used the health check skill", "followed the runbook", or "reviewed the support ticket" unless you actually retrieved that artifact in this conversation
-- Do not present a response as satisfying a skill unless you successfully retrieved and followed the skill
-- If a retrieved skill returns `output_contract`, `workflow_contract`, or `contract_summary`, treat those fields as binding instructions for this turn
-- When a skill contract specifies exact headings or ordering, copy those headings verbatim instead of paraphrasing them
-- When a skill contract specifies required tool calls or follow-up rules, complete them before you finalize unless the user blocks you or the tool is unavailable
-- Before sending the final answer, silently check that every required section from the skill contract is present and in order
-- Return only the requested document or answer body. Do not append a skill-usage footer unless the skill contract explicitly requires one
-- If the user asks for a health check, cluster audit, review, or support-package style finding, prefer the relevant skill and evidence from available tools over ad hoc live Redis diagnostics unless the user explicitly names a live instance/cluster or target discovery returns an exact live match
-- If the request only includes a hostname and it does not resolve exactly as a live target, ask for package/account/cluster context or continue with the retrieved skill workflow instead of guessing
-- Support-package findings describe captured package contents, not the current live state of a hostname or cluster
-
-Only call categories that are available in your current tool list.
-
-## What NOT to Do
-
-- ❌ Don't call 5+ tools in parallel
-- ❌ Don't run multiple variations of the same search
-- ❌ Don't fetch multiple files at once - read one, analyze, then decide if you need more
-- ❌ Don't try to gather everything upfront
-
-## Guidelines
-- Answer questions iteratively - it's OK to take multiple turns
-- Start with the most likely source of relevant info
-- Be conversational about what you're finding and what you'll check next
-- For truly exhaustive multi-topic analysis, suggest "deep triage"
+Never suggest or run cluster mutation commands, including failover, reset, meet, forget, or slot migration. Use knowledge and ticket tools only when available, and retrieve a runbook or skill before claiming it was followed.
 
 {REDIS_COMMAND_SEMANTICS_GUARDRAILS}
-
-## Redis Enterprise / Redis Cloud Notes
-- For managed Redis, INFO output can be misleading
-- Use available diagnostics/admin-api tools for accurate configuration details
-- Don't suggest CONFIG SET for managed deployments
-- For Redis Enterprise CRDB/Active-Active checks, `list_crdbs` is the source of
-  truth before saying whether a database is part of a CRDB.
 """
 
 
@@ -438,7 +352,6 @@ class ChatAgent:
         redis_cluster: Optional[RedisCluster] = None,
         progress_emitter: Optional[ProgressEmitter] = None,
         exclude_mcp_categories: Optional[List["ToolCapability"]] = None,
-        support_package_path: Optional["Path"] = None,
     ):
         """Initialize the Chat agent.
 
@@ -449,15 +362,11 @@ class ChatAgent:
             exclude_mcp_categories: Optional list of MCP tool capability categories to exclude.
                 Use this to filter out specific types of MCP tools. Common categories:
                 METRICS, LOGS, TICKETS, REPOS, TRACES, DIAGNOSTICS, KNOWLEDGE, UTILITIES.
-            support_package_path: Optional path to an extracted support package.
-                When provided, loads tools for analyzing logs, diagnostics, and
-                Redis data from the package.
         """
         self.settings = settings
         self.redis_instance = redis_instance
         self.redis_cluster = redis_cluster
         self.exclude_mcp_categories = exclude_mcp_categories
-        self.support_package_path = support_package_path
 
         self._emitter = progress_emitter if progress_emitter is not None else NullEmitter()
 
@@ -1230,11 +1139,6 @@ class ChatAgent:
             cache_client = get_redis_client()
             logger.info(f"Tool caching enabled for instance {self.redis_instance.id}")
 
-        support_package_path = self.support_package_path
-        scope_support_package_path = turn_scope.support_package_context.get("support_package_path")
-        if support_package_path is None and scope_support_package_path:
-            support_package_path = Path(scope_support_package_path)
-
         has_attached_scope = (
             turn_scope.scope_kind == "target_bindings" and turn_scope.target_count > 0
         )
@@ -1249,7 +1153,6 @@ class ChatAgent:
             initial_target_bindings=turn_scope.bindings or None,
             initial_toolset_generation=turn_scope.toolset_generation,
             exclude_mcp_categories=self.exclude_mcp_categories,
-            support_package_path=support_package_path,
             cache_client=cache_client,
             cache_ttl_overrides=settings.tool_cache_ttl_overrides or None,
             thread_id=tool_thread_id,
@@ -1456,11 +1359,6 @@ User Query: {query}"""
         if settings.tool_cache_enabled and self.redis_instance:
             cache_client = get_redis_client()
 
-        support_package_path = self.support_package_path
-        scope_support_package_path = turn_scope.support_package_context.get("support_package_path")
-        if support_package_path is None and scope_support_package_path:
-            support_package_path = Path(scope_support_package_path)
-
         has_attached_scope = (
             turn_scope.scope_kind == "target_bindings" and turn_scope.target_count > 0
         )
@@ -1474,7 +1372,6 @@ User Query: {query}"""
             initial_target_bindings=turn_scope.bindings or None,
             initial_toolset_generation=turn_scope.toolset_generation,
             exclude_mcp_categories=self.exclude_mcp_categories,
-            support_package_path=support_package_path,
             cache_client=cache_client,
             cache_ttl_overrides=settings.tool_cache_ttl_overrides or None,
             thread_id=tool_thread_id,

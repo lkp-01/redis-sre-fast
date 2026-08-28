@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from docket import Docket
@@ -12,7 +11,6 @@ from redis_sre_agent.core.clusters import get_cluster_by_id
 from redis_sre_agent.core.helper_utils import get_docket_redis_url as get_redis_url
 from redis_sre_agent.core.instances import get_instance_by_id
 from redis_sre_agent.core.redis import get_redis_client
-from redis_sre_agent.core.support_package_helpers import get_support_package_manager
 from redis_sre_agent.core.tasks import create_task
 from redis_sre_agent.core.threads import ThreadManager
 from redis_sre_agent.core.turn_scope import build_legacy_target_scope_adapter
@@ -42,25 +40,11 @@ async def _validate_thread(thread_id: str, *, redis_client: Any) -> None:
         raise ValueError(f"Thread {thread_id} not found")
 
 
-async def _resolve_support_package_context(support_package_id: str) -> Dict[str, str]:
-    manager = get_support_package_manager()
-    metadata = await manager.get_metadata(support_package_id)
-    if not metadata:
-        raise ValueError(f"Support package not found: {support_package_id}")
-
-    support_package_path = await manager.extract(support_package_id)
-    return {
-        "support_package_id": support_package_id,
-        "support_package_path": str(Path(support_package_path)),
-    }
-
-
 async def queue_query_task_helper(
     *,
     query: str,
     instance_id: Optional[str] = None,
     cluster_id: Optional[str] = None,
-    support_package_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     agent: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -84,15 +68,11 @@ async def queue_query_task_helper(
         if not cluster:
             raise ValueError(f"Cluster not found: {cluster_id}")
 
-    support_package_context = (
-        await _resolve_support_package_context(support_package_id) if support_package_id else {}
-    )
     _, thread_context = build_legacy_target_scope_adapter(
         instance_id=instance_id,
         cluster_id=cluster_id,
         thread_id=thread_id,
         session_id=thread_id,
-        support_package_context=support_package_context,
         resolution_policy="require_target" if (instance_id or cluster_id) else "allow_zero_scope",
     )
     thread_context = {

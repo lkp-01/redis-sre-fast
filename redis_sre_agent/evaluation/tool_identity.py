@@ -14,10 +14,7 @@ _PROVIDER_FAMILY_ALIASES = {
     "knowledge": "knowledge",
     "loki": "loki",
     "prometheus": "prometheus",
-    "re_admin": "redis_enterprise_admin",
-    "redis_cloud": "redis_cloud",
     "redis_command": "redis_command",
-    "redis_enterprise_admin": "redis_enterprise_admin",
     "target_discovery": "target_discovery",
     "utilities": "utilities",
 }

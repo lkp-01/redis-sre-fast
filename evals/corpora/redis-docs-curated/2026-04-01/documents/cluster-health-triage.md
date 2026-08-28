@@ -5,9 +5,9 @@ title: Cluster Health Triage
 doc_type: knowledge
 category: incident
 priority: high
-summary: Use cluster-level admin evidence before inferring Redis Enterprise health from a single database view.
+summary: Use CLUSTER INFO and node-level evidence before inferring OSS cluster health from one node.
 source: fixture://corpora/redis-docs-curated/2026-04-01/documents/cluster-health-triage.md
 ---
-Use cluster-admin health evidence instead of a single database `INFO` view when deciding whether a Redis Enterprise cluster is unhealthy.
+Use `CLUSTER INFO`, `CLUSTER NODES`, and replica health evidence instead of a single-node `INFO` view when deciding whether an OSS cluster is unhealthy.
 
 One resyncing database does not necessarily mean the whole cluster is down.

@@ -52,10 +52,9 @@ def derive_stable_path(source_url: str) -> str:
 
 
 class DocumentCategory(str, Enum):
-    """Document categorization for Redis SRE knowledge."""
+    """Document categorization for the standard Redis knowledge corpus."""
 
     OSS = "oss"
-    ENTERPRISE = "enterprise"
     SHARED = "shared"
 
 

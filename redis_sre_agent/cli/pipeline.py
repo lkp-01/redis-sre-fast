@@ -106,7 +106,7 @@ def pipeline():
 @click.option("--artifacts-path", default="./artifacts", help="Path to store artifacts")
 @click.option(
     "--scrapers",
-    help=("Comma-separated list of scrapers to run (redis_docs,redis_docs_local,redis_cloud_api)"),
+    help="Comma-separated list of scrapers to run (redis_docs,redis_docs_local)",
 )
 @click.option(
     "--latest-only",
@@ -214,7 +214,7 @@ def ingest(batch_date: str, artifacts_path: str, latest_only: bool, verbose: boo
 @click.option("--artifacts-path", default="./artifacts", help="Path to store artifacts")
 @click.option(
     "--scrapers",
-    help=("Comma-separated list of scrapers to run (redis_docs,redis_docs_local,redis_cloud_api)"),
+    help="Comma-separated list of scrapers to run (redis_docs,redis_docs_local)",
 )
 @click.option(
     "--latest-only",

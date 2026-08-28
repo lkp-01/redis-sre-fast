@@ -1,13 +1,13 @@
 id: retrieval/skill-maintenance-checklist
 name: Retrieval-only skill query finds maintenance checklist
-description: Retrieval suite skill case should surface the Redis Enterprise maintenance checklist skill.
+description: Retrieval suite skill case should surface the OSS cluster maintenance checklist skill.
 
 provenance:
   source_kind: mixed
   source_pack: redis-docs-curated
   source_pack_version: 2026-04-01
   derived_from:
-    - redis-enterprise-maintenance-checklist
+    - oss-cluster-maintenance-checklist
   synthetic:
     is_synthetic: false
   golden:
@@ -20,7 +20,7 @@ provenance:
 execution:
   lane: agent_only
   agent: knowledge
-  query: redis-enterprise-maintenance-checklist
+  query: oss-cluster-maintenance-checklist
   max_tool_steps: 3
   llm_mode: replay
 
@@ -37,4 +37,4 @@ knowledge:
 
 expectations:
   required_sources:
-    - redis-enterprise-maintenance-checklist
+    - oss-cluster-maintenance-checklist

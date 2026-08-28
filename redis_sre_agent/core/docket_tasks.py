@@ -170,6 +170,9 @@ async def _stage_session_instance_from_message(
         user_id=thread_user_id,
         instance_type=RedisInstanceType.unknown,
     )
+    from .redis_topology import classify_redis_endpoint
+
+    session_instance.instance_type = await classify_redis_endpoint(connection_url)
     if not await add_session_instance(thread_id, session_instance):
         raise ValueError("Failed to stage session instance from provided details")
     return session_instance
@@ -180,8 +183,6 @@ def _serialize_session_instance_snapshot(instance: RedisInstance) -> Dict[str, A
     payload = instance.model_dump(mode="json")
     if payload.get("connection_url"):
         payload["connection_url"] = encrypt_secret(payload["connection_url"])
-    if payload.get("admin_password"):
-        payload["admin_password"] = encrypt_secret(payload["admin_password"])
     return payload
 
 
@@ -190,8 +191,6 @@ def _deserialize_session_instance_snapshot(payload: Dict[str, Any]) -> RedisInst
     data = dict(payload)
     if data.get("connection_url"):
         data["connection_url"] = get_secret_value(data["connection_url"])
-    if data.get("admin_password"):
-        data["admin_password"] = get_secret_value(data["admin_password"])
     return RedisInstance(**data)
 
 

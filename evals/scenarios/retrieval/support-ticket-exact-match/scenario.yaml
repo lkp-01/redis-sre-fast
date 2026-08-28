@@ -26,7 +26,7 @@ execution:
     I need prior support-ticket evidence for three cases: ticket RET-5032, checkout cache
     memory pressure that should be confirmed with INFO memory, and maintenance-window
     failover churn during a node drain. Which tickets match each case, and which one is the
-    reviewed Redis Enterprise maintenance incident?
+    reviewed OSS cluster maintenance incident?
   max_tool_steps: 5
   llm_mode: replay
 
@@ -42,7 +42,7 @@ expectations:
   forbidden_tool_calls: []
   required_findings:
     - exact ticket identifiers hit the intended support record first
-    - semantic maintenance-churn queries still surface the reviewed Redis Enterprise incident
+    - semantic maintenance-churn queries still surface the reviewed OSS cluster incident
   forbidden_claims: []
   required_sources:
     - RET-5032

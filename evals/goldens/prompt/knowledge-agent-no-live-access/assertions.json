@@ -4,10 +4,6 @@
     {
       "provider_family": "redis_command",
       "operation": "info"
-    },
-    {
-      "provider_family": "redis_enterprise_admin",
-      "operation": "get_cluster_info"
     }
   ],
   "required_response_patterns": [],
@@ -17,7 +13,7 @@
   ],
   "forbidden_claims": [
     "i checked your redis instance",
-    "run get_cluster_info"
+    "claim a live cluster check"
   ],
   "required_sources": [
     "no-live-instance-claims",

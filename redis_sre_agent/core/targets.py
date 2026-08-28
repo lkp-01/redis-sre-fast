@@ -63,8 +63,6 @@ _USAGE_TERMS = {"cache", "queue", "session", "analytics", "custom"}
 _INSTANCE_HINTS = {"instance", "database", "db"}
 _CLUSTER_HINTS = {"cluster", "subscription"}
 _TYPE_HINTS = {
-    "enterprise": "redis_enterprise",
-    "cloud": "redis_cloud",
     "oss": "oss_single",
     "clustered": "oss_cluster",
 }
@@ -128,9 +126,6 @@ class TargetCatalogDoc(BaseModel):
     monitoring_identifier: Optional[str] = None
     logging_identifier: Optional[str] = None
     cluster_id: Optional[str] = None
-    redis_cloud_subscription_id: Optional[str] = None
-    redis_cloud_database_id: Optional[str] = None
-    redis_cloud_database_name: Optional[str] = None
     search_text: str = ""
     search_aliases: List[str] = Field(default_factory=list)
     capabilities: List[str] = Field(default_factory=list)
@@ -604,47 +599,17 @@ def _extract_safe_aliases(extension_data: Optional[Dict[str, Any]]) -> List[str]
 
 
 def _instance_capabilities(instance: RedisInstance) -> List[str]:
-    capabilities = ["redis", "diagnostics", "metrics", "logs"]
-    instance_type = _normalize(
-        instance.instance_type.value
-        if hasattr(instance.instance_type, "value")
-        else instance.instance_type
-    )
-    if instance_type == "redis_enterprise":
-        capabilities.append("admin")
-    if instance_type == "redis_cloud":
-        capabilities.append("cloud")
-    return _dedupe(capabilities)
+    return ["redis", "diagnostics", "metrics", "logs"]
 
 
 def _cluster_capabilities(cluster: RedisCluster) -> List[str]:
-    cluster_type = _normalize(
-        cluster.cluster_type.value
-        if hasattr(cluster.cluster_type, "value")
-        else cluster.cluster_type
-    )
-    capabilities = ["redis", "diagnostics", "metrics", "logs"]
-    if cluster_type == "redis_enterprise":
-        capabilities.append("admin")
-    if cluster_type == "redis_cloud":
-        capabilities.append("cloud")
-    return _dedupe(capabilities)
+    return ["redis", "metadata"]
 
 
 def build_target_doc_from_instance(instance: RedisInstance) -> TargetCatalogDoc:
     """Build a safe unified target document from a Redis instance."""
     repo_slug, repo_tokens = _safe_repo_tokens(instance.repo_url)
     aliases = _extract_safe_aliases(instance.extension_data)
-    cloud_subscription_id = (
-        str(instance.redis_cloud_subscription_id)
-        if instance.redis_cloud_subscription_id is not None
-        else None
-    )
-    cloud_database_id = (
-        str(instance.redis_cloud_database_id)
-        if instance.redis_cloud_database_id is not None
-        else None
-    )
     safe_bits = _dedupe(
         [
             instance.name,
@@ -654,7 +619,6 @@ def build_target_doc_from_instance(instance: RedisInstance) -> TargetCatalogDoc:
             instance.notes,
             instance.monitoring_identifier,
             instance.logging_identifier,
-            instance.redis_cloud_database_name,
             repo_slug,
             *repo_tokens,
             *aliases,
@@ -682,9 +646,6 @@ def build_target_doc_from_instance(instance: RedisInstance) -> TargetCatalogDoc:
         monitoring_identifier=instance.monitoring_identifier,
         logging_identifier=instance.logging_identifier,
         cluster_id=instance.cluster_id,
-        redis_cloud_subscription_id=cloud_subscription_id,
-        redis_cloud_database_id=cloud_database_id,
-        redis_cloud_database_name=instance.redis_cloud_database_name,
         search_text=" ".join(safe_bits),
         search_aliases=aliases,
         capabilities=_instance_capabilities(instance),
@@ -839,9 +800,6 @@ async def sync_target_catalog(
                     "repo_slug": doc.repo_slug or "",
                     "monitoring_identifier": doc.monitoring_identifier or "",
                     "logging_identifier": doc.logging_identifier or "",
-                    "redis_cloud_subscription_id": doc.redis_cloud_subscription_id or "",
-                    "redis_cloud_database_id": doc.redis_cloud_database_id or "",
-                    "redis_cloud_database_name": doc.redis_cloud_database_name or "",
                     "search_aliases": ",".join(doc.search_aliases),
                     "capabilities": ",".join(doc.capabilities),
                     "updated_at": _to_epoch(doc.updated_at),
@@ -1134,7 +1092,6 @@ def _exact_target_terms(doc: TargetCatalogDoc) -> set[str]:
         doc.resource_id,
         doc.monitoring_identifier,
         doc.logging_identifier,
-        doc.redis_cloud_database_name,
     }
     values.update(doc.search_aliases)
     return {normalized for value in values if (normalized := _normalize(value))}

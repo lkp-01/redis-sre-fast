@@ -13,23 +13,37 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, SecretStr, field_serializer, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from redisvl.query import CountQuery, FilterQuery
 from redisvl.query.filter import Tag
 
-from .encryption import encrypt_secret, get_secret_value
 from .redis import SRE_CLUSTERS_INDEX, get_clusters_index, get_redis_client
 from .redisearch import tag_contains_expression
 
 logger = logging.getLogger(__name__)
+_persisted_cluster_load_error_count = 0
+
+
+def _record_persisted_cluster_load_error(source: str) -> None:
+    """Record malformed persisted data without logging its secret-bearing payload."""
+    global _persisted_cluster_load_error_count
+    _persisted_cluster_load_error_count += 1
+    logger.error(
+        "Failed to load persisted Redis cluster from %s; load_error_count=%d",
+        source,
+        _persisted_cluster_load_error_count,
+    )
+
+
+def get_persisted_cluster_load_error_count() -> int:
+    """Return the process-local count of malformed persisted cluster records."""
+    return _persisted_cluster_load_error_count
 
 
 class RedisClusterType(str, Enum):
     """Supported cluster types."""
 
     oss_cluster = "oss_cluster"
-    redis_enterprise = "redis_enterprise"
-    redis_cloud = "redis_cloud"
     unknown = "unknown"
 
 
@@ -42,11 +56,6 @@ class RedisCluster(BaseModel):
     environment: str = Field(..., description="Environment: development, staging, production, test")
     description: str
     notes: Optional[str] = None
-
-    # Cluster-level enterprise admin credentials
-    admin_url: Optional[str] = None
-    admin_username: Optional[str] = None
-    admin_password: Optional[SecretStr] = None
 
     status: Optional[str] = "unknown"
     version: Optional[str] = None
@@ -68,12 +77,6 @@ class RedisCluster(BaseModel):
     )
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
-    @field_serializer("admin_password", when_used="json")
-    def dump_secret(self, v):
-        if v is None:
-            return None
-        return v.get_secret_value() if isinstance(v, SecretStr) else v
 
     @field_validator("name")
     @classmethod
@@ -98,29 +101,6 @@ class RedisCluster(BaseModel):
         if v not in {"user", "agent"}:
             raise ValueError(f"created_by must be 'user' or 'agent', got: {v}")
         return v
-
-    @model_validator(mode="after")
-    def validate_enterprise_admin_fields(self):
-        has_url = bool((self.admin_url or "").strip())
-        has_username = bool((self.admin_username or "").strip())
-        has_password = bool(self.admin_password)
-
-        if self.cluster_type == RedisClusterType.redis_enterprise:
-            if not (has_url and has_username and has_password):
-                raise ValueError(
-                    "cluster_type=redis_enterprise requires admin_url, admin_username, "
-                    "and admin_password"
-                )
-            return self
-
-        if has_url or has_username or has_password:
-            raise ValueError(
-                "admin_url/admin_username/admin_password are only valid for "
-                "cluster_type=redis_enterprise"
-            )
-
-        return self
-
 
 @dataclass
 class ClusterQueryResult:
@@ -185,11 +165,9 @@ async def _load_clusters_from_index() -> List[RedisCluster]:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             cluster_data = json.loads(raw)
-            if cluster_data.get("admin_password"):
-                cluster_data["admin_password"] = get_secret_value(cluster_data["admin_password"])
             out.append(RedisCluster(**cluster_data))
-        except Exception as e:
-            logger.exception("Failed to load cluster from search result: %s. Skipping.", e)
+        except Exception:
+            _record_persisted_cluster_load_error("search index")
     return out
 
 
@@ -287,13 +265,9 @@ async def query_clusters(
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8")
                 cluster_data = json.loads(raw)
-                if cluster_data.get("admin_password"):
-                    cluster_data["admin_password"] = get_secret_value(
-                        cluster_data["admin_password"]
-                    )
                 clusters.append(RedisCluster(**cluster_data))
-            except Exception as e:
-                logger.exception("Failed to load cluster from query result: %s. Skipping.", e)
+            except Exception:
+                _record_persisted_cluster_load_error("query result")
 
         if _authz_on:
             clusters, total = await scope_and_paginate(
@@ -314,8 +288,6 @@ async def _upsert_cluster_index_doc(cluster: RedisCluster) -> bool:
         key = f"{SRE_CLUSTERS_INDEX}:{cluster.id}"
 
         cluster_dict = cluster.model_dump(mode="json")
-        if cluster_dict.get("admin_password"):
-            cluster_dict["admin_password"] = encrypt_secret(cluster_dict["admin_password"])
 
         created_ts = _to_epoch(cluster_dict.get("created_at"))
         updated_ts = _to_epoch(cluster_dict.get("updated_at"))
@@ -361,7 +333,30 @@ async def delete_cluster_index_doc(cluster_id: str) -> None:
         return
 
 
+_PERSISTED_CLUSTER_TYPES = {RedisClusterType.oss_cluster}
+
+
+def _validate_persistable_clusters(clusters: List[RedisCluster]) -> None:
+    """Reject Cluster metadata that is not an OSS Cluster grouping record."""
+    unsupported = sorted(
+        {cluster.cluster_type.value for cluster in clusters}
+        - {cluster_type.value for cluster_type in _PERSISTED_CLUSTER_TYPES}
+    )
+    if unsupported:
+        rendered = ", ".join(unsupported)
+        raise ValueError(
+            "Formal Redis Cluster persistence only supports oss_cluster; "
+            f"got: {rendered}"
+        )
+
+
 async def save_clusters(clusters: List[RedisCluster]) -> bool:
+    """Persist only OSS Cluster grouping metadata."""
+    _validate_persistable_clusters(clusters)
+    return await _save_clusters(clusters)
+
+
+async def _save_clusters(clusters: List[RedisCluster]) -> bool:
     """Persist clusters using per-cluster hash docs + search index."""
     try:
         client = get_redis_client()
@@ -455,9 +450,6 @@ async def get_cluster_by_id(cluster_id: str) -> Optional[RedisCluster]:
             data = data.decode("utf-8")
 
         cluster_data = json.loads(data)
-        if cluster_data.get("admin_password"):
-            cluster_data["admin_password"] = get_secret_value(cluster_data["admin_password"])
-
         cluster = RedisCluster(**cluster_data)
         # Infrastructure authorization chokepoint: a denied principal gets None (the
         # existing not-found path), so no caller can obtain a cluster it may not access.
@@ -466,6 +458,6 @@ async def get_cluster_by_id(cluster_id: str) -> Optional[RedisCluster]:
         if not await assert_target_allowed(TargetRef.from_cluster(cluster)):
             return None
         return cluster
-    except Exception as e:
-        logger.exception("Failed to get cluster by ID %s: %s", cluster_id, e)
+    except Exception:
+        _record_persisted_cluster_load_error("direct lookup")
         return None

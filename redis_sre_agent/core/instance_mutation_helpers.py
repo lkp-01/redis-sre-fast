@@ -49,17 +49,14 @@ async def _validate_instance_cluster_link(
         if hasattr(cluster.cluster_type, "value")
         else str(cluster.cluster_type).strip().lower()
     )
-    compatible_cluster_types = {
-        "redis_enterprise": {"redis_enterprise"},
-        "oss_cluster": {"oss_cluster"},
-        "redis_cloud": {"redis_cloud"},
-    }
-    allowed_cluster_types = compatible_cluster_types.get(normalized_instance_type)
-    if allowed_cluster_types and cluster_type not in allowed_cluster_types:
-        allowed_list = ", ".join(sorted(allowed_cluster_types))
+    if normalized_instance_type != RedisInstanceType.oss_cluster.value:
+        raise RuntimeError(
+            "Only oss_cluster instances may be linked to a Redis Cluster metadata record"
+        )
+    if cluster_type != "oss_cluster":
         raise RuntimeError(
             f"instance_type '{normalized_instance_type}' is incompatible with cluster_type "
-            f"'{cluster_type}'. Allowed cluster_type(s): {allowed_list}"
+            f"'{cluster_type}'. Allowed cluster_type: oss_cluster"
         )
 
     return normalized_cluster_id
@@ -93,14 +90,7 @@ async def update_instance_helper(
     monitoring_identifier: Optional[str] = None,
     logging_identifier: Optional[str] = None,
     instance_type: Optional[str] = None,
-    admin_url: Optional[str] = None,
-    admin_username: Optional[str] = None,
-    admin_password: Optional[str] = None,
     cluster_id: Optional[str] = None,
-    redis_cloud_subscription_id: Optional[int] = None,
-    redis_cloud_database_id: Optional[int] = None,
-    redis_cloud_subscription_type: Optional[str] = None,
-    redis_cloud_database_name: Optional[str] = None,
     status: Optional[str] = None,
     version: Optional[str] = None,
     memory: Optional[str] = None,
@@ -138,22 +128,8 @@ async def update_instance_helper(
         update_data["logging_identifier"] = logging_identifier
     if instance_type is not None:
         update_data["instance_type"] = RedisInstanceType(instance_type.lower())
-    if admin_url is not None:
-        update_data["admin_url"] = admin_url
-    if admin_username is not None:
-        update_data["admin_username"] = admin_username
-    if admin_password is not None:
-        update_data["admin_password"] = admin_password
     if cluster_id is not None:
         update_data["cluster_id"] = _normalize_cluster_id(cluster_id)
-    if redis_cloud_subscription_id is not None:
-        update_data["redis_cloud_subscription_id"] = redis_cloud_subscription_id
-    if redis_cloud_database_id is not None:
-        update_data["redis_cloud_database_id"] = redis_cloud_database_id
-    if redis_cloud_subscription_type is not None:
-        update_data["redis_cloud_subscription_type"] = redis_cloud_subscription_type.lower()
-    if redis_cloud_database_name is not None:
-        update_data["redis_cloud_database_name"] = redis_cloud_database_name
     if status is not None:
         update_data["status"] = status
     if version is not None:
@@ -164,6 +140,15 @@ async def update_instance_helper(
         update_data["connections"] = connections
     if user_id is not None:
         update_data["user_id"] = user_id
+
+    if connection_url is not None or instance_type is not None:
+        from redis_sre_agent.core.redis_topology import classify_redis_endpoint
+
+        effective_connection_url = connection_url or current.connection_url.get_secret_value()
+        update_data["instance_type"] = await classify_redis_endpoint(
+            effective_connection_url,
+            update_data.get("instance_type", current.instance_type),
+        )
 
     effective_instance_type = update_data.get("instance_type", current.instance_type)
     effective_cluster_id = update_data.get("cluster_id", current.cluster_id)

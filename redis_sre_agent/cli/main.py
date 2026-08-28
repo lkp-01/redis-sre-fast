@@ -29,7 +29,6 @@ _COMMANDS = {
     "mcp": "redis_sre_agent.cli.mcp:mcp",
     "index": "redis_sre_agent.cli.index:index",
     "knowledge-pack": "redis_sre_agent.cli.knowledge_pack:knowledge_pack",
-    "support-package": "redis_sre_agent.cli.support_package:support_package",
     "eval": "redis_sre_agent.cli.eval:eval",
     "feedback": "redis_sre_agent.cli.feedback:feedback",
     "login": "redis_sre_agent.cli.auth:login",

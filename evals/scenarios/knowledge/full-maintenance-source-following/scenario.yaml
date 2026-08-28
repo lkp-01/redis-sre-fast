@@ -10,7 +10,7 @@ provenance:
     - redis_sre_agent.agent.knowledge_agent.KNOWLEDGE_SYSTEM_PROMPT
     - evals/corpora/redis-docs-curated/2026-04-01/documents/maintenance-mode-overview.md
     - evals/corpora/redis-docs-curated/2026-04-01/documents/maintenance-mode-guidance.md
-    - evals/corpora/redis-docs-curated/2026-04-01/skills/redis-enterprise-maintenance-checklist.md
+    - evals/corpora/redis-docs-curated/2026-04-01/skills/oss-cluster-maintenance-checklist.md
     - evals/corpora/redis-docs-curated/2026-04-01/tickets/RET-5032.yaml
   synthetic:
     is_synthetic: false
@@ -25,7 +25,7 @@ execution:
   lane: agent_only
   agent: knowledge_only
   query: >
-    I do not have live cluster access. Give me a concise numbered Redis Enterprise
+    I do not have live cluster access. Give me a concise numbered OSS Redis Cluster
     pre-change maintenance workflow based only on the available documented
     evidence. State explicitly that current cluster state is unknown from this
     lane, and include the key pre-change checks you would perform before changing
@@ -51,5 +51,5 @@ expectations:
   required_sources:
     - maintenance-mode-overview
     - maintenance-mode-guidance
-    - redis-enterprise-maintenance-checklist
+    - oss-cluster-maintenance-checklist
     - RET-5032

@@ -63,7 +63,6 @@ async def route_to_appropriate_agent(
     Route a query to the appropriate agent using a fast LLM categorization.
 
     Routing logic:
-    - Requests with support-package scope always use REDIS_TRIAGE
     - Explicit deep/comprehensive triage requests use REDIS_TRIAGE
     - All other requests use REDIS_CHAT, including zero-scope knowledge questions
 
@@ -82,15 +81,9 @@ async def route_to_appropriate_agent(
     has_cluster = context and context.get("cluster_id")
     attached_target_handles = get_attached_target_handles_from_context(context)
     has_attached_targets = bool(attached_target_handles)
-    has_support_package = context and context.get("support_package_path")
     has_diagnostic_scope = bool(has_instance or has_cluster or has_attached_targets)
 
-    # 1. Has support package - route to triage (needs diagnostic tools)
-    if has_support_package:
-        logger.info("Support package provided - routing to REDIS_TRIAGE for diagnostic tools")
-        return AgentType.REDIS_TRIAGE
-
-    # 2. Has user preference and diagnostic scope - use it.
+    # 1. Has user preference and diagnostic scope - use it.
     # Zero-scope requests still go through intent routing before target discovery.
     if user_preferences and user_preferences.get("preferred_agent"):
         preferred = user_preferences["preferred_agent"]
@@ -98,7 +91,7 @@ async def route_to_appropriate_agent(
             logger.info(f"Using user preference: {preferred}")
             return AgentType(preferred)
 
-    # 3. Use LLM to categorize triage vs chat.
+    # 2. Use LLM to categorize triage vs chat.
     # This must run before the zero-scope fallback so explicit deep-triage
     # requests can enter target discovery.
     context_str = format_conversation_context(conversation_history)

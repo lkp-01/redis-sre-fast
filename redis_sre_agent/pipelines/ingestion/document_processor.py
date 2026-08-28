@@ -76,27 +76,6 @@ class DocumentProcessor:
             )
             return []
 
-        whole_threshold = int(self.config.get("whole_doc_threshold", 6000))
-        src = (document.source_url or "").lower()
-        title = (document.title or "").lower()
-        is_cli_doc = (
-            "rladmin" in content.lower()
-            or "rladmin" in title
-            or "cli-utilities" in src
-            or "/rladmin/" in src
-        )
-        if is_cli_doc and len(content) <= whole_threshold:
-            return [self._create_chunk(document, content, 0)]
-
-        is_api_doc = (
-            "/references/rest-api/" in src
-            or "/rest-api/requests/" in src
-            or "/operate/rs/references/rest-api/" in src
-        )
-        whole_api_threshold = int(self.config.get("whole_api_threshold", 12000))
-        if is_api_doc and len(content) <= whole_api_threshold:
-            return [self._create_chunk(document, content, 0)]
-
         if len(content) <= self.config["chunk_size"]:
             return [self._create_chunk(document, content, 0)]
 

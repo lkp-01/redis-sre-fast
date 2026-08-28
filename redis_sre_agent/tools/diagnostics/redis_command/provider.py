@@ -69,8 +69,8 @@ class RedisCommandToolProvider(ToolProvider):
     - FT._LIST (list Search indexes)
     - FT.INFO (Search index information)
 
-    Note: MEMORY DOCTOR and LATENCY DOCTOR are not included as they are not
-    available in Redis Cloud and some Redis versions.
+    Note: MEMORY DOCTOR and LATENCY DOCTOR are not included because availability
+    varies across Redis versions.
 
     The provider is initialized with a connection URL and manages the Redis client lifecycle.
     """
@@ -279,14 +279,53 @@ class RedisCommandToolProvider(ToolProvider):
                     "required": [],
                 },
             ),
-            # NOTE: MEMORY DOCTOR and LATENCY DOCTOR are not available in Redis Cloud
-            # and some Redis versions, so they have been removed
+            # MEMORY DOCTOR and LATENCY DOCTOR vary across Redis versions.
             ToolDefinition(
                 name=self._make_tool_name("cluster_info"),
                 description=(
                     "Get Redis cluster information using CLUSTER INFO. Use this to check "
                     "cluster state, slots distribution, and cluster health. Only works "
                     "if Redis is running in cluster mode."
+                ),
+                capability=ToolCapability.DIAGNOSTICS,
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
+                name=self._make_tool_name("cluster_nodes"),
+                description=(
+                    "Get Redis Cluster node membership, flags, link state, replication "
+                    "relationships, and assigned slot ranges using CLUSTER NODES. "
+                    "Only works if Redis is running in cluster mode."
+                ),
+                capability=ToolCapability.DIAGNOSTICS,
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
+                name=self._make_tool_name("cluster_slots"),
+                description=(
+                    "Get Redis Cluster slot-range ownership and replica assignments using "
+                    "CLUSTER SLOTS. Only works if Redis is running in cluster mode."
+                ),
+                capability=ToolCapability.DIAGNOSTICS,
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            ),
+            ToolDefinition(
+                name=self._make_tool_name("cluster_readiness"),
+                description=(
+                    "Get a read-only Redis Cluster failover-readiness assessment based on "
+                    "cluster state, node flags, slot ownership, and replication evidence."
                 ),
                 capability=ToolCapability.DIAGNOSTICS,
                 parameters={
@@ -419,6 +458,12 @@ class RedisCommandToolProvider(ToolProvider):
             if "index" in tool_name:
                 return "search_index_info"
             return "info"
+        if op == "nodes" and "cluster" in tool_name:
+            return "cluster_nodes"
+        if op == "slots" and "cluster" in tool_name:
+            return "cluster_slots"
+        if op == "readiness" and "cluster" in tool_name:
+            return "cluster_readiness"
         if op == "slowlog":
             return "slowlog"
         if op == "log" and "acl" in tool_name:
@@ -630,6 +675,114 @@ class RedisCommandToolProvider(ToolProvider):
                 "error": str(e),
                 "note": "This command only works in cluster mode",
             }
+
+    @staticmethod
+    def _cluster_text(value: Any) -> str:
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+
+    @staticmethod
+    def _cluster_endpoint(node: Any) -> Dict[str, Any]:
+        values = list(node) if isinstance(node, (list, tuple)) else []
+        host = RedisCommandToolProvider._cluster_text(values[0]) if values else None
+        port = int(values[1]) if len(values) > 1 else None
+        node_id = RedisCommandToolProvider._cluster_text(values[2]) if len(values) > 2 else None
+        return {"host": host, "port": port, "node_id": node_id}
+
+    @status_update("I'm checking Redis Cluster node topology.")
+    async def cluster_nodes(self) -> Dict[str, Any]:
+        """Return a stable, structured view of ``CLUSTER NODES`` output."""
+        logger.info("Executing CLUSTER NODES")
+        try:
+            raw = await self.get_client().execute_command("CLUSTER", "NODES")
+            nodes: List[Dict[str, Any]] = []
+            for line in self._cluster_text(raw).splitlines():
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                master_id = None if parts[3] == "-" else parts[3]
+                try:
+                    config_epoch = int(parts[6])
+                except ValueError:
+                    config_epoch = 0
+                nodes.append(
+                    {
+                        "node_id": parts[0],
+                        "address": parts[1],
+                        "flags": sorted(flag for flag in parts[2].split(",") if flag),
+                        "master_id": master_id,
+                        "config_epoch": config_epoch,
+                        "link_state": parts[7],
+                        "slots": parts[8:],
+                    }
+                )
+            return {"status": "success", "nodes": nodes}
+        except Exception as e:
+            logger.error("Failed to execute CLUSTER NODES: %s", e)
+            return {
+                "status": "error",
+                "error": str(e),
+                "note": "This command only works in cluster mode",
+            }
+
+    @status_update("I'm checking Redis Cluster slot ownership.")
+    async def cluster_slots(self) -> Dict[str, Any]:
+        """Return a stable, structured view of ``CLUSTER SLOTS`` output."""
+        logger.info("Executing CLUSTER SLOTS")
+        try:
+            raw = await self.get_client().execute_command("CLUSTER", "SLOTS")
+            slots: List[Dict[str, Any]] = []
+            for slot_range in raw or []:
+                if len(slot_range) < 3:
+                    continue
+                slots.append(
+                    {
+                        "start": int(slot_range[0]),
+                        "end": int(slot_range[1]),
+                        "primary": self._cluster_endpoint(slot_range[2]),
+                        "replicas": [self._cluster_endpoint(node) for node in slot_range[3:]],
+                    }
+                )
+            return {"status": "success", "slots": slots}
+        except Exception as e:
+            logger.error("Failed to execute CLUSTER SLOTS: %s", e)
+            return {
+                "status": "error",
+                "error": str(e),
+                "note": "This command only works in cluster mode",
+            }
+
+    @status_update("I'm assessing Redis Cluster failover readiness from read-only topology data.")
+    async def cluster_readiness(self) -> Dict[str, Any]:
+        """Summarize read-only topology evidence relevant to failover readiness."""
+        cluster = await self.cluster_info()
+        nodes = await self.cluster_nodes()
+        slots = await self.cluster_slots()
+        replication = await self.replication_info()
+        evidence = {
+            "cluster": cluster,
+            "nodes": nodes,
+            "slots": slots,
+            "replication": replication,
+        }
+        failures = [
+            node.get("node_id")
+            for node in nodes.get("nodes", [])
+            if {"fail", "pfail"}.intersection(set(node.get("flags", [])))
+        ]
+        cluster_info = cluster.get("cluster_info", {})
+        cluster_state = (
+            cluster_info.get("cluster_state") if isinstance(cluster_info, dict) else None
+        )
+        summary = {
+            "cluster_state": cluster_state,
+            "primary_nodes": sum("master" in node.get("flags", []) for node in nodes.get("nodes", [])),
+            "replica_nodes": sum("slave" in node.get("flags", []) for node in nodes.get("nodes", [])),
+            "failed_nodes": failures,
+            "slot_ranges": len(slots.get("slots", [])),
+        }
+        if any(result.get("status") != "success" for result in evidence.values()):
+            return {"status": "error", "summary": summary, "evidence": evidence}
+        return {"status": "success", "summary": summary, "evidence": evidence}
 
     @status_update("I'm checking Redis replication info.")
     async def replication_info(self) -> Dict[str, Any]:

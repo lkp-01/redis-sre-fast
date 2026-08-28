@@ -6,9 +6,9 @@ doc_type: runbook
 category: incident
 priority: critical
 pinned: true
-summary: Maintenance mode can explain failover churn in Redis Enterprise during planned work.
+summary: Planned node maintenance can explain failover churn in an OSS Redis Cluster.
 source: fixture://corpora/redis-docs-curated/2026-04-01/documents/maintenance-mode-overview.md
 ---
-During Redis Enterprise maintenance windows, failover churn can be expected if nodes are draining or not accepting new servers.
+During planned OSS Redis Cluster maintenance, failover churn can be expected while nodes are drained or restarted.
 
-Verify cluster-admin state and replica health before treating the event as a generic OSS failover problem.
+Verify `CLUSTER INFO`, node membership, and replica health before treating the event as an unexpected failover.

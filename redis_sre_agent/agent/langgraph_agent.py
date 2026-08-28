@@ -9,12 +9,10 @@ import hashlib
 import json
 import logging
 import re
-from pathlib import Path
-from typing import Any, Callable, Dict, List, NotRequired, Optional, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -38,7 +36,7 @@ from ..core.instances import (
     save_instances,
 )
 from ..core.llm_helpers import create_llm, create_mini_llm
-from ..core.llm_request_guard import GuardedMemoizeLLMProxy, guarded_ainvoke
+from ..core.llm_request_guard import guarded_ainvoke
 from ..core.progress import NullEmitter, ProgressEmitter
 from ..core.redis import get_redis_client
 from ..core.targets import (
@@ -353,136 +351,11 @@ async def _collect_cluster_instance_diagnostics(
     }
 
 
-def _get_secret_value(secret: Any) -> str:
-    """Extract secret value from SecretStr or return plain string.
-
-    Handles both SecretStr (from Pydantic) and plain str (after decryption).
-    """
-    from pydantic import SecretStr
-
-    if isinstance(secret, SecretStr):
-        return secret.get_secret_value()
-    return str(secret)
-
-
 def _mask_redis_url_credentials(url: str) -> str:
-    """Mask username and password in Redis URL for safe logging/LLM usage.
-
-    Delegates to core.instances.mask_redis_url to avoid duplication.
-    """
+    """Mask a Redis URL before including it in a log message."""
     from redis_sre_agent.core.instances import mask_redis_url
 
     return mask_redis_url(url)
-
-
-async def _detect_instance_type_with_llm(
-    instance: Any,
-    llm: Optional[BaseChatModel] = None,
-    memoize: Optional[Callable[[str, Any, List[BaseMessage]], Any]] = None,
-) -> str:
-    """Use LLM to detect Redis instance type from metadata.
-
-    Analyzes connection URL, description, notes, usage, and other metadata
-    to determine if this is redis_enterprise, oss_cluster, oss_single, or redis_cloud.
-
-    Args:
-        instance: RedisInstance with metadata to analyze
-        llm: Optional LLM to use (creates one if not provided)
-        memoize: Optional memoization callback for in-run caching
-
-    Returns:
-        Detected instance type: 'redis_enterprise', 'oss_cluster', 'oss_single', 'redis_cloud', or 'unknown'
-    """
-
-    # Create LLM if not provided
-    if llm is None:
-        llm = create_mini_llm()
-
-    # Build analysis prompt with all available metadata
-    # Extract secret value from SecretStr (or plain str after decryption)
-    connection_url_str = _get_secret_value(instance.connection_url)
-    parsed_url = urlparse(connection_url_str)
-    port = parsed_url.port or 6379
-    hostname = parsed_url.hostname or "unknown"
-
-    # Mask credentials in URL before sending to LLM
-    masked_url = _mask_redis_url_credentials(connection_url_str)
-
-    prompt = f"""Analyze this Redis instance metadata and determine its type.
-
-Instance Metadata:
-- Name: {instance.name}
-- Connection URL: {masked_url}
-- Hostname: {hostname}
-- Port: {port}
-- Environment: {instance.environment}
-- Usage: {instance.usage}
-- Description: {instance.description}
-- Notes: {instance.notes or "None"}
-
-Instance Type Definitions:
-1. **redis_enterprise**: Redis Enterprise Software or Redis Enterprise Cloud
-   - Indicators: "enterprise" in name/description/notes, port 12000-12999, hostname contains "redis-enterprise"
-   - Has cluster management, admin API, advanced features
-
-2. **oss_cluster**: Open Source Redis Cluster (multi-node)
-   - Indicators: "cluster" in name/description/notes, multiple nodes mentioned
-   - Uses Redis Cluster protocol
-
-3. **oss_single**: Open Source Redis (single node)
-   - Indicators: standard port 6379, no cluster/enterprise mentions
-   - Basic standalone Redis
-
-4. **redis_cloud**: Managed Redis services (AWS ElastiCache, Redis Cloud, etc.)
-   - Indicators: cloud provider hostnames (amazonaws.com, redislabs.com, azure, gcp)
-   - Managed service
-
-Based on the metadata above, what is the most likely instance type?
-
-Respond with ONLY ONE of these exact values:
-- redis_enterprise
-- oss_cluster
-- oss_single
-- redis_cloud
-- unknown (if truly ambiguous)
-
-Your response (one word only):"""
-
-    try:
-        if memoize:
-            response = await memoize(
-                "instance_type",
-                GuardedMemoizeLLMProxy(
-                    llm,
-                    request_kind="langgraph_agent.instance_type_detection",
-                ),
-                [HumanMessage(content=prompt)],
-            )
-        else:
-            response = await guarded_ainvoke(
-                llm,
-                [HumanMessage(content=prompt)],
-                request_kind="langgraph_agent.instance_type_detection",
-            )
-        detected_type = response.content.strip().lower()
-
-        # Validate response
-        valid_types = ["redis_enterprise", "oss_cluster", "oss_single", "redis_cloud", "unknown"]
-        if detected_type in valid_types:
-            logger.info(
-                f"LLM detected instance type '{detected_type}' for {instance.name} "
-                f"(port={port}, usage={instance.usage})"
-            )
-            return detected_type
-        else:
-            logger.warning(
-                f"LLM returned invalid instance type '{detected_type}', defaulting to 'unknown'"
-            )
-            return "unknown"
-
-    except Exception as e:
-        logger.error(f"Failed to detect instance type with LLM: {e}")
-        return "unknown"
 
 
 def _extract_instance_details_from_message(message: str) -> Optional[Dict[str, str]]:
@@ -720,7 +593,7 @@ class SRELangGraphAgent:
         return resp
 
     def _is_redis_scoped(self, text: str) -> bool:
-        """Return True if text clearly concerns Redis/Redis Enterprise/Redis Cloud.
+        """Return True if text clearly concerns a Redis protocol endpoint.
         Conservative: if detection fails, default to True to avoid skipping safety when unsure.
         """
         try:
@@ -728,7 +601,7 @@ class SRELangGraphAgent:
 
             if not text:
                 return False
-            pattern = r"(\bredis\b|redis[-_ ]enterprise|redis[-_ ]cloud|redis[-_ ]cli|\brladmin\b|\bbdbs?\b|\baof\b|\brdb\b|persistence|eviction|replication|\bcli\b)"
+            pattern = r"(\bredis\b|redis[-_ ]cli|\baof\b|\brdb\b|persistence|eviction|replication|\bcli\b)"
             return _re.search(pattern, str(text), flags=_re.IGNORECASE) is not None
         except Exception:
             return True
@@ -738,7 +611,7 @@ class SRELangGraphAgent:
         try:
             import re as _re
 
-            pattern = r"(rladmin|CONFIG\s+SET|FLUSH(?:ALL|DB)|\bEVAL\b|\bKEYS\b|/v\d+/.+(PUT|PATCH|DELETE)|https?://)"
+            pattern = r"(CONFIG\s+SET|FLUSH(?:ALL|DB)|\bEVAL\b|\bKEYS\b|https?://)"
             return _re.search(pattern, str(text or ""), flags=_re.IGNORECASE) is not None
         except Exception:
             return False
@@ -1052,113 +925,6 @@ JSON payload of analyses artifacts:
         def _augment_with_instance_context(base_prompt: str) -> str:
             """Ensure instance-type specific guidance is present exactly once."""
             prompt = base_prompt or ""
-
-            if target_instance and target_instance.instance_type == "redis_cloud":
-                marker = "## CRITICAL REDIS CLOUD CONTEXT"
-                if marker not in prompt:
-                    redis_cloud_context = """
-
-## CRITICAL REDIS CLOUD CONTEXT
-
-You are working with a **Redis Cloud** database. Redis Cloud is FUNDAMENTALLY DIFFERENT from Redis Open Source.
-
-### DO NOT Trust INFO Output for Configuration
-The INFO command shows RUNTIME STATE, not CONFIGURATION. These are NORMAL and EXPECTED in Redis Cloud:
-- `aof_enabled=1, aof_current_size=0` - AOF is managed internally by Redis Cloud
-- `slave0: ip=0.0.0.0, port=0` - Replication is managed by Redis Cloud (not visible via INFO)
-- `maxmemory=0` - Memory limits are enforced at cluster level (not visible via CONFIG GET)
-- `rdb_changes_since_last_save` - RDB snapshots are managed by Redis Cloud
-
-**STOP suggesting "fixes" for these - they are NOT problems!**
-
-### What You MUST Do First
-1. **Call `get_database` tool** to get the ACTUAL database configuration from the REST API
-2. This returns the REAL configuration: memory limits, persistence settings, replication status, clustering, security, modules, endpoints, throughput limits
-3. **If the question mentions active-active or CRDB**, also call `get_subscription` and `get_active_active_regions` to inspect subscription topology and remote regions
-4. Use INFO only for runtime metrics (ops/sec, connected clients, keyspace stats)
-
-### What You CANNOT Suggest
-- ❌ CONFIG SET for persistence, replication, clustering, maxmemory
-- ❌ BGSAVE, BGREWRITEAOF, or other persistence commands
-- ❌ REPLICAOF or replication commands
-- ❌ MODULE LOAD
-- ❌ ACL SETUSER or ACL DELUSER
-- ❌ "Fix" AOF size=0 or replica at 0.0.0.0:0
-
-### Correct Diagnostic Approach
-1. Call `get_database` to get configuration from REST API
-2. If the question is about CRDB or active-active, call `get_subscription` and `get_active_active_regions` to confirm deployment type and configured remote regions
-3. Use INFO for runtime metrics only
-4. Compare actual usage vs. configured limits
-5. Do not claim CRDB is fully synced unless you have evidence beyond local runtime metrics; the cloud API can confirm topology, but not live cross-region sync lag
-6. Provide recommendations based on ACTUAL configuration, not INFO output
-
-**Remember: Redis Cloud manages persistence, replication, clustering, and modules automatically. Use the REST API to see the real configuration!**
-                    """
-                    prompt += redis_cloud_context
-                # Redis Cloud is mutually exclusive with Redis Enterprise context.
-                # Always return from the cloud branch, even when marker already exists.
-                return prompt
-
-            if target_instance and target_instance.instance_type == "redis_enterprise":
-                marker = "## CRITICAL REDIS ENTERPRISE CONTEXT"
-                if marker not in prompt:
-                    redis_enterprise_context = """
-
-## CRITICAL REDIS ENTERPRISE CONTEXT
-
-You are working with a **Redis Enterprise** database. Redis Enterprise is FUNDAMENTALLY DIFFERENT from Redis Open Source.
-
-### DO NOT Trust INFO Output for Configuration
-The INFO command shows RUNTIME STATE, not CONFIGURATION. These are NORMAL and EXPECTED in Redis Enterprise:
-- `aof_enabled=1, aof_current_size=0` - AOF is managed internally by Redis Enterprise
-- `slave0: ip=0.0.0.0, port=0` - Replication is managed by Redis Enterprise (not visible via INFO)
-- `maxmemory=0` - Memory limits are enforced at cluster level (not visible via CONFIG GET)
-- `rdb_changes_since_last_save` - RDB snapshots are managed by Redis Enterprise
-
-**STOP suggesting "fixes" for these - they are NOT problems!**
-
-### What You MUST Do First
-1. **Call `get_cluster_info` tool** to check overall cluster health
-2. **Call `get_database` tool** to get the ACTUAL database configuration from the Admin REST API
-3. **Call `list_nodes` tool** to check node status (especially maintenance mode: `accept_servers=false`)
-4. **Call `list_shards` tool** to check shard distribution
-5. **For CRDB/Active-Active questions**, call `list_crdbs` first, then `get_crdb`, `get_crdb_health_report`, `get_crdt_syncer_state`, and `get_sync_source_stats` as needed to inspect CRDB topology, peers/sites, replication link health, syncer state, and lag.
-6. Use INFO only for runtime metrics (ops/sec, connected clients, keyspace stats)
-
-### What You CANNOT Suggest
-- ❌ CONFIG SET for persistence, replication, clustering, maxmemory
-- ❌ BGSAVE, BGREWRITEAOF, or other persistence commands
-- ❌ REPLICAOF or replication commands
-- ❌ MODULE LOAD
-- ❌ ACL SETUSER or ACL DELUSER
-- ❌ "Fix" AOF size=0 or replica at 0.0.0.0:0
-
-### Correct Diagnostic Approach
-1. Call `get_cluster_info` to check cluster health
-2. Call `list_nodes` to check for nodes in maintenance mode or degraded state
-3. Call `get_database` to get database configuration from Admin REST API
-4. Call `list_shards` to check shard distribution
-5. For CRDB/Active-Active questions, call `list_crdbs` and match by CRDB name, CRDB GUID, local BDB UID (`local_databases[].bdb_uid`), or instance `db_uid`; do not claim a database is not CRDB solely because a `get_database` response lacks optional CRDT fields.
-6. If multiple CRDBs match the requested name or UID, ask for clarification before using topology or health tools.
-7. If no CRDBs are configured or no CRDB matches, state that only after checking `list_crdbs`.
-8. For CRDB sync failures or lag, call `get_crdb_health_report`, `get_crdt_syncer_state`, `get_sync_source_stats`, and `get_logs` for recent CRDB/CRDT/syncer/resync/link events.
-9. Use INFO for runtime metrics only
-10. Compare actual usage vs. configured limits
-11. Provide recommendations based on ACTUAL configuration, not INFO output
-
-### Critical: Check for Maintenance Mode
-Nodes with `accept_servers=false` are in MAINTENANCE MODE and won't accept new shards. This is a common cause of issues!
-
-**Remember: Redis Enterprise manages persistence, replication, clustering, and modules automatically. Use the Admin REST API to see the real configuration!**
-
-### CLI Command Guidance (rladmin)
-- Never invent or guess rladmin subcommands. Examples that DO NOT EXIST: `rladmin list databases`, `rladmin get database name <db>`, `rladmin list shards`, `rladmin get database stats`.
-- Before suggesting any rladmin command, use the `search_knowledge_base` tool to find the exact syntax in the Redis Enterprise documentation and cite the source.
-- Prefer the Admin REST API tools available to you (`get_cluster_info`, `get_database`, `list_nodes`, `list_shards`). Do NOT turn tool names into CLI commands.
-- If you cannot find a documented rladmin command for the task, omit CLI suggestions and stick to Admin REST API guidance.
-"""
-                    prompt += redis_enterprise_context
 
             return prompt
 
@@ -1495,10 +1261,8 @@ Nodes with `accept_servers=false` are in MAINTENANCE MODE and won't accept new s
                     TopicsList
                 )  # return TopicsList
                 instance_ctx = {
-                    "instance_type": (
-                        target_instance.instance_type if target_instance else "support_package"
-                    ),
-                    "name": target_instance.name if target_instance else "support_package_analysis",
+                    "instance_type": target_instance.instance_type if target_instance else "unscoped",
+                    "name": target_instance.name if target_instance else "unscoped_analysis",
                 }
                 preface = (
                     "About this JSON: summarized signals from upstream tool calls (each has a tool description, args, and key findings).\n"
@@ -1555,10 +1319,8 @@ Nodes with `accept_servers=false` are in MAINTENANCE MODE and won't accept new s
 
                 rec_tasks = []
                 instance_ctx = {
-                    "instance_type": (
-                        target_instance.instance_type if target_instance else "support_package"
-                    ),
-                    "name": target_instance.name if target_instance else "support_package_analysis",
+                    "instance_type": target_instance.instance_type if target_instance else "unscoped",
+                    "name": target_instance.name if target_instance else "unscoped_analysis",
                 }
                 # Build knowledge-only adapters locally (mini model)
                 from redis_sre_agent.tools.models import ToolCapability as _ToolCap
@@ -1641,12 +1403,8 @@ Nodes with `accept_servers=false` are in MAINTENANCE MODE and won't accept new s
 
                 try:
                     instance_ctx_local = {
-                        "instance_type": (
-                            target_instance.instance_type if target_instance else "support_package"
-                        ),
-                        "name": (
-                            target_instance.name if target_instance else "support_package_analysis"
-                        ),
+                        "instance_type": target_instance.instance_type if target_instance else "unscoped",
+                        "name": target_instance.name if target_instance else "unscoped_analysis",
                     }
                     composed_markdown = await self._compose_final_markdown(
                         initial_assessment_lines=[initial_writeup] if initial_writeup else [],
@@ -1831,31 +1589,6 @@ Nodes with `accept_servers=false` are in MAINTENANCE MODE and won't accept new s
             build_attached_target_scope_prompt,
         )
 
-        def _build_support_package_context(
-            support_pkg_path: Optional[str] = None,
-        ) -> Optional[str]:
-            if support_pkg_path is None:
-                support_pkg_path = normalized_context.get("support_package_path")
-            if not support_pkg_path:
-                return None
-            return f"""IMPORTANT CONTEXT: This query is specifically about a Redis Enterprise support package.
-- Support Package Path: {support_pkg_path}
-
-You have access to support package diagnostic tools that can:
-- List databases in the package (support_package_*_list_databases)
-- Get Redis INFO output for specific databases (support_package_*_get_info)
-- Get SLOWLOG entries (support_package_*_get_slowlog)
-- Get CLIENT LIST output (support_package_*_get_client_list)
-- Search logs for patterns (support_package_*_search_logs)
-- Get log files (support_package_*_get_logs)
-- Get package summary (support_package_*_get_summary)
-
-FOCUS ON THE SUPPORT PACKAGE: Do NOT try to connect to live Redis instances. Instead, use the support package tools to analyze the data captured in the package. Start by listing the databases in the package to understand what's available.
-
-Please use the support package tools to analyze this package and answer the user's question."""
-
-        support_package_context = _build_support_package_context()
-
         if (
             attached_prompt_scope
             and not explicit_instance_scope_id
@@ -1871,14 +1604,7 @@ Please use the support package tools to analyze this package and answer the user
             if not prompt and has_attached_scope and turn_scope.single_binding is not None:
                 prompt = build_single_attached_binding_prompt(turn_scope.single_binding)
             if prompt:
-                if support_package_context:
-                    enhanced_query = f"""{prompt}
-
-{support_package_context}
-
-User Query: {query}"""
-                else:
-                    enhanced_query = f"""{prompt}
+                enhanced_query = f"""{prompt}
 
 User Query: {query}"""
 
@@ -2051,40 +1777,6 @@ Focus on cluster-level analysis and use instance-level diagnostics only if the u
 
 CONTEXT: This query mentioned Redis cluster ID: {cluster_id}, but there was an error retrieving cluster details. Please proceed with general Redis troubleshooting."""
 
-        elif normalized_context.get("support_package_path"):
-            # Support package provided without specific instance - focus on the package
-            support_pkg_path = normalized_context["support_package_path"]
-            logger.info(
-                f"Support package provided without instance - focusing on package: {support_pkg_path}"
-            )
-            support_package_prompt = support_package_context or _build_support_package_context(
-                support_pkg_path
-            )
-
-            prompt = await _get_attached_target_prompt()
-            if not prompt and attached_prompt_scope:
-                prompt = build_attached_target_prompt_fallback(
-                    attached_target_count=attached_target_count,
-                    bindings=turn_scope.bindings,
-                    attached_handles=raw_attached_target_handles,
-                )
-            if prompt:
-                if support_package_prompt:
-                    enhanced_query = f"""{prompt}
-
-{support_package_prompt}
-
-User Query: {query}"""
-                else:
-                    enhanced_query = f"""{prompt}
-
-User Query: {query}"""
-            else:
-                if support_package_prompt:
-                    enhanced_query = f"""User Query: {query}
-
-{support_package_prompt}"""
-
         else:
             prompt = await _get_attached_target_prompt()
             if not prompt and attached_prompt_scope:
@@ -2256,150 +1948,35 @@ Alternatively, if you're looking for general Redis knowledge or best practices (
         # can include the actual tool instructions available for this query.
         initial_instance_context = normalized_context if normalized_context else None
 
-        # INSTANCE TYPE TRIAGE: Detect and validate instance type before loading tools
+        # INSTANCE TYPE TRIAGE: classify a transient target through the Redis protocol.
         if target_instance and target_instance.instance_type in ["unknown", None]:
-            logger.info(
-                f"Instance '{target_instance.name}' has unknown type, attempting LLM-based detection"
-            )
-            detected_type = await _detect_instance_type_with_llm(
-                target_instance, self.llm, memoize=self._ainvoke_memo
-            )
+            from ..core.redis_topology import probe_redis_topology
 
-            if detected_type != "unknown":
-                logger.info(
-                    f"Detected instance type '{detected_type}' for '{target_instance.name}'"
+            probe_result = await probe_redis_topology(
+                target_instance.connection_url.get_secret_value()
+            )
+            if not probe_result.succeeded:
+                return AgentResponse(
+                    response=(
+                        "I could not classify this Redis endpoint through the Redis protocol. "
+                        f"Resolve the connection issue and retry: {probe_result.error_summary}"
+                    ),
+                    search_results=[],
                 )
-                # Update the instance with detected type
-                target_instance.instance_type = detected_type
 
-                # Save the updated instance type
-                try:
-                    # Persist path: save_instances() has REPLACE semantics (it deletes any stored
-                    # instance not in this list), so it MUST see the FULL registry. Scoping here
-                    # would permanently delete every instance the principal can't access.
-                    instances = await get_instances()
-                    for i, inst in enumerate(instances):
-                        if inst.id == target_instance.id:
-                            instances[i] = target_instance
+            target_instance.instance_type = probe_result.instance_type
+            try:
+                # save_instances() has replacement semantics, so update only if this
+                # target is part of the full formal registry.
+                instances = await get_instances()
+                if any(instance.id == target_instance.id for instance in instances):
+                    for index, instance in enumerate(instances):
+                        if instance.id == target_instance.id:
+                            instances[index] = target_instance
                             break
                     await save_instances(instances)
-                    logger.info(
-                        f"Updated instance '{target_instance.name}' with type '{detected_type}'"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to save updated instance type: {e}")
-
-        # Validate Redis Enterprise instances have required admin credentials.
-        # Resolve cluster-linked credentials first and fallback to deprecated
-        # instance admin_* fields for compatibility mode.
-        has_admin_url = False
-        if target_instance and target_instance.instance_type == "redis_enterprise":
-            (
-                target_instance,
-                enterprise_admin_source,
-            ) = await ToolManager.resolve_redis_enterprise_admin_instance(target_instance)
-            has_admin_url = bool(target_instance.admin_url and target_instance.admin_url.strip())
-            if enterprise_admin_source == "cluster":
-                logger.info(
-                    "Resolved Redis Enterprise admin credentials from cluster_id '%s' for instance '%s'",
-                    target_instance.cluster_id,
-                    target_instance.name,
-                )
-            elif enterprise_admin_source == "instance":
-                logger.warning(
-                    "Using deprecated instance admin_* fields for Redis Enterprise instance '%s'. "
-                    "Prefer cluster_id + RedisCluster admin credentials.",
-                    target_instance.name,
-                )
-
-        if (
-            target_instance
-            and target_instance.instance_type == "redis_enterprise"
-            and not has_admin_url
-        ):
-            logger.warning(
-                f"Redis Enterprise instance '{target_instance.name}' detected but missing admin_url"
-            )
-
-            # Return early with helpful message asking for admin credentials
-            return AgentResponse(
-                response=f"""I've detected that **{target_instance.name}** is a Redis Enterprise instance, but I'm missing the admin API credentials needed for full diagnostics.
-
-To enable Redis Enterprise cluster monitoring and diagnostics, please provide:
-
-1. **Admin API URL** (typically port 9443)
-2. **Admin Username** (e.g., `admin@redis.com`)
-3. **Admin Password**
-
-You can provide these either:
-- on a linked **RedisCluster** (recommended), then set the instance `cluster_id`, or
-- on deprecated instance-level `admin_*` fields (compatibility mode)
-
-**For example, if you're using the agen'ts Docker Compose setup**:
-- Admin URL: `https://redis-enterprise:9443`
-- Default username: `admin@redis.com`
-- Default password: `admin` (check your docker-compose.yml)
-
-You can update the instance configuration through the UI or API, and I'll be able to:
-- ✅ Check cluster health and node status
-- ✅ Monitor database (BDB) configurations
-- ✅ Detect stuck operations or maintenance mode
-- ✅ View shard distribution and replication status
-- ✅ Access Redis Enterprise-specific metrics
-
-For now, I can still perform basic Redis diagnostics using the database connection URL, but cluster-level insights will be limited.""",
-                search_results=[],
-            )
-
-        # Validate Redis Cloud instances have required API credentials
-        import os
-
-        has_cloud_credentials = os.getenv("TOOLS_REDIS_CLOUD_API_KEY") and os.getenv(
-            "TOOLS_REDIS_CLOUD_API_SECRET_KEY"
-        )
-
-        if (
-            target_instance
-            and target_instance.instance_type == "redis_cloud"
-            and not has_cloud_credentials
-        ):
-            logger.warning(
-                f"Redis Cloud instance '{target_instance.name}' detected but missing API credentials"
-            )
-
-            # Return early with helpful message asking for API credentials
-            return AgentResponse(
-                response=f"""I've detected that **{target_instance.name}** is a Redis Cloud instance, but I'm missing the Redis Cloud Management API credentials needed for full cloud resource management.
-
-To enable Redis Cloud Management API tools, please set these environment variables:
-
-1. **TOOLS_REDIS_CLOUD_API_KEY** - Your Redis Cloud API key
-2. **TOOLS_REDIS_CLOUD_API_SECRET_KEY** - Your Redis Cloud API secret key
-
-**To get your API credentials**:
-1. Log in to [Redis Cloud Console](https://app.redislabs.com/)
-2. Navigate to **Settings** → **Account** → **API Keys**
-3. Click **Generate API Key**
-4. Copy the API Key and Secret Key (secret is only shown once!)
-
-Once configured, I'll be able to:
-- ✅ List and inspect subscriptions
-- ✅ View database configurations and status
-- ✅ Monitor account resources
-- ✅ Check task status for async operations
-- ✅ Manage users and access control
-- ✅ View cloud account details
-
-For now, I can still perform basic Redis diagnostics using the database connection URL, but cloud management features will be limited.""",
-                search_results=[],
-            )
-
-        # Extract support package path from context if provided
-        support_package_path = None
-        if turn_scope.support_package_context.get("support_package_path"):
-            pkg_path = turn_scope.support_package_context["support_package_path"]
-            support_package_path = Path(pkg_path) if isinstance(pkg_path, str) else pkg_path
-            logger.info(f"Processing query with support package: {support_package_path}")
+            except Exception as e:
+                logger.error("Failed to save protocol-classified instance type: %s", e)
 
         # Get cache client if tool caching is enabled
         cache_client = None
@@ -2420,7 +1997,6 @@ For now, I can still perform basic Redis diagnostics using the database connecti
             redis_cluster=target_cluster,
             initial_target_bindings=initial_target_bindings,
             initial_toolset_generation=initial_toolset_generation,
-            support_package_path=support_package_path,
             cache_client=cache_client,
             cache_ttl_overrides=settings.tool_cache_ttl_overrides or None,
             thread_id=tool_thread_id or session_id,
@@ -2880,11 +2456,6 @@ For now, I can still perform basic Redis diagnostics using the database connecti
 
                     target_cluster = await get_cluster_by_id(cluster_id)
 
-            support_package_path = None
-            if turn_scope.support_package_context.get("support_package_path"):
-                pkg_path = turn_scope.support_package_context["support_package_path"]
-                support_package_path = Path(pkg_path) if isinstance(pkg_path, str) else pkg_path
-
             cache_client = None
             if settings.tool_cache_enabled and target_instance:
                 cache_client = get_redis_client()
@@ -2903,7 +2474,6 @@ For now, I can still perform basic Redis diagnostics using the database connecti
                 redis_cluster=target_cluster,
                 initial_target_bindings=initial_target_bindings,
                 initial_toolset_generation=initial_toolset_generation,
-                support_package_path=support_package_path,
                 cache_client=cache_client,
                 cache_ttl_overrides=settings.tool_cache_ttl_overrides or None,
                 thread_id=tool_thread_id or session_id,

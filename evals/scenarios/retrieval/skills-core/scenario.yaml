@@ -24,8 +24,8 @@ execution:
   agent: knowledge_only
   query: >
     I need documented skills for two cases: memory pressure triage on an OSS cache, and
-    Redis Enterprise failover churn during maintenance. Which skill names best match each
-    case, and which one is the Redis Enterprise maintenance checklist?
+    OSS Redis Cluster failover churn during maintenance. Which skill names best match each
+    case, and which one is the OSS cluster maintenance checklist?
   max_tool_steps: 5
   llm_mode: replay
 
@@ -41,11 +41,11 @@ expectations:
   forbidden_tool_calls: []
   required_findings:
     - memory-pressure queries match iterative memory skills
-    - maintenance failover queries match the Redis Enterprise checklist
+    - maintenance failover queries match the OSS cluster checklist
   forbidden_claims: []
   required_sources:
     - iterative-memory-check
     - iterative-redis-triage
     - evidence-first-triage
     - failover-investigation-skill
-    - redis-enterprise-maintenance-checklist
+    - oss-cluster-maintenance-checklist

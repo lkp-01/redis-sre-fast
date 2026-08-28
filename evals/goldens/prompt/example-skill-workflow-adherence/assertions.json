@@ -24,7 +24,7 @@
   ],
   "forbidden_claims": [
     "i need a private tool",
-    "send me the support package",
+    "use an unregistered private tool",
     "skill used"
   ],
   "required_sources": [

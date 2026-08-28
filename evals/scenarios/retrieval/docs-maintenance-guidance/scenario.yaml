@@ -1,6 +1,6 @@
 id: retrieval/docs-maintenance-guidance
 name: Retrieval-only doc query finds maintenance guidance
-description: Retrieval suite doc case should surface the Redis Enterprise maintenance guidance document.
+description: Retrieval suite doc case should surface the OSS cluster maintenance guidance document.
 
 provenance:
   source_kind: mixed
@@ -21,7 +21,7 @@ execution:
   lane: agent_only
   agent: knowledge
   query: >
-    Find the document named Maintenance Mode Guidance for Redis Enterprise and
+    Find the document named Maintenance Mode Guidance for an OSS Redis Cluster and
     summarize the guidance it gives about maintenance mode.
   max_tool_steps: 5
   llm_mode: replay

@@ -149,8 +149,8 @@ def build_recommendation_worker(
                 "- Use placeholders like <cluster-mgr>, <admin>, <pass> where needed.\n"
                 "- If sources are insufficient, add an Investigate step instead of guessing.\n"
                 "- DO NOT include or suggest any internal agent tool names (e.g., re_admin_*, redis_command_*, loki_*, prometheus_*). The operator cannot run them.\n"
-                "- Translate verification and commands to operator-accessible forms only: rladmin, redis-cli, Redis Enterprise Admin API (curl with method/path/payload), or Redis Cloud UI/API steps.\n"
-                "- If exact Admin API payloads are unknown, instruct: 'Open an investigation to obtain exact Admin Console steps or REST API payloads. Do not guess API payloads.'\n"
+                "- Translate verification and commands to operator-accessible Redis protocol forms only, such as redis-cli.\n"
+                "- If exact syntax is unknown, instruct the operator to consult the applicable Redis documentation; do not guess commands.\n"
                 "- Output must match the Recommendation schema."
             )
         )

@@ -1,4 +1,4 @@
-"""Redis documentation scraper for local clone of redis/docs repo."""
+"""OSS-only scraper for a local clone of the redis/docs repository."""
 
 import logging
 from pathlib import Path
@@ -36,10 +36,12 @@ class RedisDocsLocalScraper(BaseScraper):
             # Note: redis/docs repo structure has all content at top level (no "latest/" prefix).
             # Versioned content (e.g., develop/ai/redisvl/0.9.0/) is filtered by --latest-only.
             "content_paths": [
-                "commands",  # Redis commands reference
-                "develop",  # Development guides
-                "integrate",  # Integration guides
-                "operate",  # Operations and SRE content (includes rs/, rc/, oss_and_stack/)
+                "commands",
+                "data-types",
+                "develop",
+                "integrate",
+                "management",
+                "operate/oss_and_stack",
             ],
             # File patterns to include
             "include_patterns": ["*.md", "*.markdown"],
@@ -123,6 +125,7 @@ class RedisDocsLocalScraper(BaseScraper):
         """Discover all markdown files to process."""
         markdown_files = []
 
+        allowed_prefixes = tuple(f"{path.rstrip('/')}/" for path in self.config["content_paths"])
         for content_path in self.config["content_paths"]:
             search_dir = content_dir / content_path
 
@@ -137,10 +140,13 @@ class RedisDocsLocalScraper(BaseScraper):
                     if any(md_file.name == exclude for exclude in self.config["exclude_patterns"]):
                         continue
 
+                    rel_path = md_file.relative_to(content_dir).as_posix()
+                    if not rel_path.startswith(allowed_prefixes):
+                        continue
+
                     # latest-only: skip files in versioned directories like 0.9.0/
                     if self.config.get("latest_only"):
-                        rel_path = md_file.relative_to(content_dir)
-                        rel_parts = rel_path.parts
+                        rel_parts = md_file.relative_to(content_dir).parts
                         # Skip files in versioned directories (e.g., develop/ai/redisvl/0.9.0/)
                         if any(self._is_version_dir(p) for p in rel_parts):
                             continue
@@ -240,13 +246,7 @@ class RedisDocsLocalScraper(BaseScraper):
 
         rel_path = str(md_file.relative_to(content_dir))
 
-        # Determine category
-        if "operate/rs" in rel_path or "enterprise" in rel_path.lower():
-            category = DocumentCategory.ENTERPRISE
-        elif "operate/oss" in rel_path or "oss" in rel_path.lower():
-            category = DocumentCategory.OSS
-        else:
-            category = DocumentCategory.SHARED
+        category = DocumentCategory.OSS
 
         # Determine doc type
         if "commands" in rel_path:
@@ -255,9 +255,6 @@ class RedisDocsLocalScraper(BaseScraper):
         elif "operate" in rel_path or "troubleshoot" in rel_path.lower():
             doc_type = DocumentType.RUNBOOK
             severity = SeverityLevel.HIGH
-        elif "cli-utilities" in rel_path or "rladmin" in rel_path.lower():
-            doc_type = DocumentType.REFERENCE
-            severity = SeverityLevel.CRITICAL  # CLI tools are critical for SRE
         elif "develop" in rel_path:
             doc_type = DocumentType.DOCUMENTATION
             severity = SeverityLevel.MEDIUM

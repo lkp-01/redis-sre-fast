@@ -7,7 +7,6 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .ingestion.processor import IngestionPipeline
 from .scraper.base import ArtifactStorage
-from .scraper.redis_cloud_api import RedisCloudAPIScraper
 from .scraper.redis_docs import RedisDocsScraper
 from .scraper.redis_docs_local import RedisDocsLocalScraper
 
@@ -21,7 +20,6 @@ class PipelineOrchestrator:
     SCRAPER_CLASSES = {
         "redis_docs": RedisDocsScraper,
         "redis_docs_local": RedisDocsLocalScraper,
-        "redis_cloud_api": RedisCloudAPIScraper,
     }
 
     ProgressCallback = Callable[[str, str, Optional[Dict[str, Any]]], Awaitable[None]]

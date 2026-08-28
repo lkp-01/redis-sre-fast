@@ -11,10 +11,8 @@ from redis_sre_agent.core.redis import test_redis_connection
 
 
 def _mask_instance_payload(instance: Any) -> Dict[str, Any]:
-    payload = instance.model_dump(mode="json", exclude={"connection_url", "admin_password"})
+    payload = instance.model_dump(mode="json", exclude={"connection_url"})
     payload["connection_url"] = mask_redis_url(instance.connection_url)
-    if instance.admin_password:
-        payload["admin_password"] = "***"
     return payload
 
 

@@ -109,10 +109,6 @@ def _infer_eval_instance_type(entry: Any) -> str:
         .strip()
         .lower()
     )
-    if deployment in {"redis_enterprise", "enterprise"}:
-        return "redis_enterprise"
-    if deployment in {"redis_cloud", "cloud"}:
-        return "redis_cloud"
     if deployment in {"oss_cluster", "cluster"}:
         return "oss_cluster"
     return "oss_single"
@@ -123,7 +119,7 @@ def _build_eval_target_private_ref(entry: Any, *, binding_subject: str) -> dict[
 
     environment = str(entry.public_metadata.get("environment") or "test")
     if entry.kind == "cluster":
-        cluster_type = str(entry.cluster_type or "redis_enterprise").strip().lower()
+        cluster_type = "oss_cluster"
         seed: dict[str, Any] = {
             "seed_kind": "cluster",
             "id": binding_subject,
@@ -132,14 +128,6 @@ def _build_eval_target_private_ref(entry: Any, *, binding_subject: str) -> dict[
             "environment": environment,
             "description": f"Eval target seed for {entry.display_name}",
         }
-        if cluster_type == "redis_enterprise":
-            seed.update(
-                {
-                    "admin_url": "https://eval-target.invalid:9443",
-                    "admin_username": "eval",
-                    "admin_password": "eval-password",
-                }
-            )
         return {"target_kind": entry.kind, "eval_target_seed": seed}
 
     instance_type = _infer_eval_instance_type(entry)
@@ -153,24 +141,6 @@ def _build_eval_target_private_ref(entry: Any, *, binding_subject: str) -> dict[
         "description": f"Eval target seed for {entry.display_name}",
         "instance_type": instance_type,
     }
-    if instance_type == "redis_enterprise":
-        seed.update(
-            {
-                "cluster_id": binding_subject,
-                "admin_url": "https://eval-target.invalid:9443",
-                "admin_username": "eval",
-                "admin_password": "eval-password",
-            }
-        )
-    elif instance_type == "redis_cloud":
-        seed.update(
-            {
-                "redis_cloud_subscription_id": 1,
-                "redis_cloud_database_id": 1,
-                "redis_cloud_subscription_type": "pro",
-                "redis_cloud_database_name": entry.display_name,
-            }
-        )
     return {"target_kind": entry.kind, "eval_target_seed": seed}
 
 
@@ -263,9 +233,6 @@ def _build_eval_target_catalog_doc(entry: Any) -> TargetCatalogDoc:
         monitoring_identifier=public_metadata.get("monitoring_identifier"),
         logging_identifier=public_metadata.get("logging_identifier"),
         cluster_id=public_metadata.get("cluster_id"),
-        redis_cloud_subscription_id=public_metadata.get("redis_cloud_subscription_id"),
-        redis_cloud_database_id=public_metadata.get("redis_cloud_database_id"),
-        redis_cloud_database_name=public_metadata.get("redis_cloud_database_name"),
         search_text=search_text,
         search_aliases=[str(alias) for alias in aliases if alias not in (None, "")],
         capabilities=list(entry.capabilities or []),

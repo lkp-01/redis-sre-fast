@@ -32,7 +32,6 @@ get_knowledge_agent = get_chat_agent
 @click.argument("query")
 @click.option("--redis-instance-id", "-r", help="Redis instance ID to investigate")
 @click.option("--redis-cluster-id", "-c", help="Redis cluster ID to investigate")
-@click.option("--support-package-id", "-p", help="Support package ID to analyze")
 @click.option("--thread-id", "-t", help="Thread ID to continue an existing conversation")
 @click.option("--user-id", help="User ID to scope thread ownership and memory retrieval")
 @click.option(
@@ -46,7 +45,6 @@ def query(
     query: str,
     redis_instance_id: Optional[str],
     redis_cluster_id: Optional[str],
-    support_package_id: Optional[str],
     thread_id: Optional[str],
     user_id: Optional[str],
     agent: str,
@@ -65,7 +63,6 @@ def query(
     """
 
     async def _query():
-        from redis_sre_agent.cli.support_package import get_manager as get_support_package_manager
         from redis_sre_agent.tools.mcp.pool import MCPConnectionPool
 
         console = Console()
@@ -98,18 +95,6 @@ def query(
             if not cluster:
                 console.print(f"[red]❌ Cluster not found: {redis_cluster_id}[/red]")
                 exit(1)
-
-        # Resolve support package if provided
-        support_package_path = None
-        if support_package_id:
-            manager = get_support_package_manager()
-            metadata = await manager.get_metadata(support_package_id)
-            if not metadata:
-                console.print(f"[red]❌ Support package not found: {support_package_id}[/red]")
-                exit(1)
-            # Extract if needed and get path
-            support_package_path = await manager.extract(support_package_id)
-            console.print(f"[dim]📦 Support package: {metadata.filename}[/dim]")
 
         # Get or create thread
         active_thread_id = thread_id
@@ -154,9 +139,6 @@ def query(
                 initial_context["instance_id"] = instance.id
             elif cluster:
                 initial_context["cluster_id"] = cluster.id
-            if support_package_id:
-                initial_context["support_package_id"] = support_package_id
-                initial_context["support_package_path"] = str(support_package_path)
 
             active_thread_id = await thread_manager.create_thread(
                 user_id=resolved_user_id,
@@ -180,8 +162,6 @@ def query(
             routing_context["instance_id"] = instance.id
         elif cluster:
             routing_context["cluster_id"] = cluster.id
-        if support_package_path:
-            routing_context["support_package_path"] = str(support_package_path)
 
         # Map CLI agent choice to AgentType
         agent_choice_map = {
@@ -218,14 +198,12 @@ def query(
             )
 
         try:
-            # Build context with instance and/or support package
+            # Build context with the optional instance or cluster target.
             context = {}
             if instance:
                 context["instance_id"] = instance.id
             elif cluster:
                 context["cluster_id"] = cluster.id
-            if support_package_path:
-                context["support_package_path"] = str(support_package_path)
 
             # Run the agent
             agent_response = await selected_agent.process_query(

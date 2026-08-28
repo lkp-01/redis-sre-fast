@@ -65,21 +65,6 @@ scrape_configs:
         regex: 'node;demo-host'
         action: keep
 
-
-  # Redis Enterprise node metrics (local demo cluster)
-  - job_name: 'redis-enterprise-nodes'
-    scheme: https
-    metrics_path: /metrics
-    tls_config:
-      insecure_skip_verify: true  # Local demo certs
-    static_configs:
-      - targets:
-          - 'redis-enterprise-node1:9443'
-          - 'redis-enterprise-node2:9443'
-          - 'redis-enterprise-node3:9443'
-    scrape_interval: 30s
-    scrape_timeout: 10s
-
   # SRE Agent application metrics (if implemented)
   - job_name: 'sre-agent'
     static_configs:

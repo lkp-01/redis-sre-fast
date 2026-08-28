@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, SecretStr, field_serializer, field_validator, model_validator
 from redisvl.query import CountQuery, FilterQuery
@@ -29,6 +29,23 @@ from .redis import (
 from .redisearch import tag_contains_expression
 
 logger = logging.getLogger(__name__)
+_persisted_instance_load_error_count = 0
+
+
+def _record_persisted_instance_load_error(source: str) -> None:
+    """Record a malformed persisted record without logging its secret-bearing payload."""
+    global _persisted_instance_load_error_count
+    _persisted_instance_load_error_count += 1
+    logger.error(
+        "Failed to load persisted Redis instance from %s; load_error_count=%d",
+        source,
+        _persisted_instance_load_error_count,
+    )
+
+
+def get_persisted_instance_load_error_count() -> int:
+    """Return the process-local count of malformed persisted instance records."""
+    return _persisted_instance_load_error_count
 
 
 def mask_redis_url(url: Any) -> str:
@@ -78,8 +95,6 @@ def mask_redis_url(url: Any) -> str:
 class RedisInstanceType(str, Enum):
     oss_single = "oss_single"
     oss_cluster = "oss_cluster"
-    redis_enterprise = "redis_enterprise"
-    redis_cloud = "redis_cloud"
     unknown = "unknown"
 
 
@@ -97,7 +112,7 @@ class RedisInstance(BaseModel):
     )
     environment: str = Field(..., description="Environment: development, staging, production, test")
 
-    @field_serializer("connection_url", "admin_password", when_used="json")
+    @field_serializer("connection_url", when_used="json")
     def dump_secret(self, v):
         if v is None:
             return None
@@ -115,56 +130,10 @@ class RedisInstance(BaseModel):
     )
     instance_type: "RedisInstanceType" = Field(
         ...,
-        description="Redis instance type: oss_single, oss_cluster, redis_enterprise, redis_cloud, unknown",
+        description="Redis instance type: oss_single, oss_cluster, or unknown for a transient draft",
     )
-    admin_url: Annotated[
-        Optional[str],
-        Field(
-            deprecated=True,
-            description=(
-                "DEPRECATED: Redis Enterprise admin API URL. Prefer configuring credentials "
-                "on linked RedisCluster and using cluster_id."
-            ),
-        ),
-    ] = None
-    admin_username: Annotated[
-        Optional[str],
-        Field(
-            deprecated=True,
-            description=(
-                "DEPRECATED: Redis Enterprise admin API username. Prefer configuring credentials "
-                "on linked RedisCluster and using cluster_id."
-            ),
-        ),
-    ] = None
-    admin_password: Annotated[
-        Optional[SecretStr],
-        Field(
-            deprecated=True,
-            description=(
-                "DEPRECATED: Redis Enterprise admin API password. Prefer configuring credentials "
-                "on linked RedisCluster and using cluster_id."
-            ),
-        ),
-    ] = None
     cluster_id: Optional[str] = Field(
         None, description="Associated cluster ID for this database instance (optional)"
-    )
-    # Redis Cloud identifiers
-    redis_cloud_subscription_id: Optional[int] = Field(
-        None, description="Redis Cloud subscription ID. Only for instance_type='redis_cloud'."
-    )
-    redis_cloud_database_id: Optional[int] = Field(
-        None, description="Redis Cloud database ID. Only for instance_type='redis_cloud'."
-    )
-    # Redis Cloud metadata for routing
-    redis_cloud_subscription_type: Optional[str] = Field(
-        default=None,
-        description="Redis Cloud subscription type: 'pro' or 'essentials' (aka 'fixed'). Only for instance_type='redis_cloud'.",
-    )
-    redis_cloud_database_name: Optional[str] = Field(
-        default=None,
-        description="Redis Cloud database name (used when ID is not available). Only for instance_type='redis_cloud'.",
     )
     status: Optional[str] = "unknown"
     version: Optional[str] = None
@@ -218,143 +187,7 @@ class RedisInstance(BaseModel):
         if isinstance(self.cluster_id, str):
             cid = self.cluster_id.strip()
             self.cluster_id = cid or None
-        if isinstance(self.admin_url, str):
-            admin_url = self.admin_url.strip()
-            self.admin_url = admin_url or None
-        if isinstance(self.admin_username, str):
-            admin_username = self.admin_username.strip()
-            self.admin_username = admin_username or None
-        admin_password_value = (
-            self.admin_password.get_secret_value()
-            if isinstance(self.admin_password, SecretStr)
-            else None
-        )
-        has_admin_url = bool(self.admin_url)
-        has_admin_username = bool(self.admin_username)
-        has_admin_password = bool(admin_password_value)
-        has_any_admin_field = has_admin_url or has_admin_username or has_admin_password
-        has_all_admin_fields = has_admin_url and has_admin_username and has_admin_password
-        if has_any_admin_field and not has_all_admin_fields:
-            raise ValueError(
-                "Deprecated admin fields must be provided together: "
-                "admin_url, admin_username, and admin_password."
-            )
         return self
-
-    async def get_bdb_uid(
-        self,
-        *,
-        redis_url: Optional[str] = None,
-        bdb_name: Optional[str] = None,
-        verify_ssl: Optional[bool] = None,
-        timeout: float = 10.0,
-    ) -> Optional[int]:
-        """Discover the Redis Enterprise database UID (BDB ID) for this instance.
-
-        Strategy:
-        - Uses deprecated instance admin credentials for compatibility mode.
-        - If bdb_name is provided: fetch /v1/bdbs and return the uid for an exact name match.
-        - Else: parse the port from redis_url or this instance's connection_url and match
-                against 'port' (non-TLS) or 'ssl_port' (TLS/rediss), falling back to
-                scanning 'endpoints' if present.
-
-        Returns:
-            UID as int if found, else None.
-        """
-        try:
-            # Require Redis Enterprise for BDB discovery
-            if self.instance_type != RedisInstanceType.redis_enterprise:
-                return None
-            if not self.admin_url:
-                return None
-
-            # Extract credentials
-            admin_username = self.admin_username or ""
-            admin_password = (
-                self.admin_password.get_secret_value()
-                if isinstance(self.admin_password, SecretStr)
-                else (self.admin_password or "")
-            )
-
-            # Compute TLS verify flag from param or env
-            import os
-
-            if verify_ssl is not None:
-                verify_flag = bool(verify_ssl)
-            else:
-                env_val = os.getenv("TOOLS_REDIS_ENTERPRISE_ADMIN_VERIFY_SSL", "true").lower()
-                verify_flag = env_val not in ("0", "false", "no", "off")
-
-            # Determine target port and whether TLS is used
-            from urllib.parse import urlparse
-
-            target_port: Optional[int] = None
-            use_tls = False
-            try:
-                url_to_parse = redis_url or (
-                    self.connection_url.get_secret_value()
-                    if isinstance(self.connection_url, SecretStr)
-                    else str(self.connection_url)
-                )
-                parsed = urlparse(url_to_parse) if url_to_parse else None
-                if parsed and parsed.port:
-                    target_port = int(parsed.port)
-                scheme = (parsed.scheme or "").lower() if parsed else ""
-                use_tls = scheme in ("rediss", "redis+ssl", "redis+tls")
-            except Exception:
-                pass
-
-            import httpx
-
-            auth = (admin_username, admin_password) if admin_username else None
-            async with httpx.AsyncClient(
-                base_url=self.admin_url,
-                auth=auth,
-                verify=verify_flag,
-                timeout=timeout,
-                headers={"Accept": "application/json"},
-            ) as client:
-                resp = await client.get("/v1/bdbs")
-                resp.raise_for_status()
-                bdbs = resp.json()
-                if not isinstance(bdbs, list):
-                    # Some versions may return {"bdbs": [...]} instead
-                    bdbs = bdbs.get("bdbs", []) if isinstance(bdbs, dict) else []
-
-                # Name preference
-                if bdb_name:
-                    for b in bdbs:
-                        try:
-                            if (b.get("name") or "") == bdb_name:
-                                return int(b.get("uid"))
-                        except Exception:
-                            continue
-
-                # Port matching
-                if target_port is not None:
-                    for b in bdbs:
-                        try:
-                            port = b.get("ssl_port") if use_tls else b.get("port")
-                            if port is None:
-                                # Fallback to endpoints array
-                                eps = b.get("endpoints") or []
-                                # endpoints may be list of dicts with {"port": ..., "tls": bool}
-                                for ep in eps:
-                                    ep_port = ep.get("port")
-                                    ep_tls = bool(ep.get("tls")) if "tls" in ep else None
-                                    if ep_port == target_port and (
-                                        ep_tls is None or ep_tls == use_tls
-                                    ):
-                                        return int(b.get("uid"))
-                                continue
-                            if int(port) == target_port:
-                                return int(b.get("uid"))
-                        except Exception:
-                            continue
-                return None
-        except Exception as e:
-            logger.debug(f"get_bdb_uid error: {e}")
-            return None
 
 
 async def _load_instances_from_index() -> List[RedisInstance]:
@@ -389,11 +222,9 @@ async def _load_instances_from_index() -> List[RedisInstance]:
             inst_data = json.loads(raw)
             if inst_data.get("connection_url"):
                 inst_data["connection_url"] = get_secret_value(inst_data["connection_url"])
-            if inst_data.get("admin_password"):
-                inst_data["admin_password"] = get_secret_value(inst_data["admin_password"])
             out.append(RedisInstance(**inst_data))
-        except Exception as e:
-            logger.exception("Failed to load instance from search result: %s. Skipping.", e)
+        except Exception:
+            _record_persisted_instance_load_error("search index")
     return out
 
 
@@ -438,7 +269,7 @@ async def query_instances(
         environment: Filter by environment (development, staging, production, test)
         usage: Filter by usage type (cache, analytics, session, queue, custom)
         status: Filter by status (healthy, unhealthy, unknown)
-        instance_type: Filter by type (oss_single, oss_cluster, redis_enterprise, redis_cloud)
+        instance_type: Filter by type (oss_single or oss_cluster)
         user_id: Filter by user ID
         search: Text search on instance name
         limit: Maximum number of results (default 100, max 1000)
@@ -529,11 +360,9 @@ async def query_instances(
                 inst_data = json.loads(raw)
                 if inst_data.get("connection_url"):
                     inst_data["connection_url"] = get_secret_value(inst_data["connection_url"])
-                if inst_data.get("admin_password"):
-                    inst_data["admin_password"] = get_secret_value(inst_data["admin_password"])
                 instances.append(RedisInstance(**inst_data))
-            except Exception as e:
-                logger.exception("Failed to load instance from query result: %s. Skipping.", e)
+            except Exception:
+                _record_persisted_instance_load_error("query result")
 
         if _authz_on:
             instances, total = await scope_and_paginate(
@@ -588,9 +417,6 @@ async def _upsert_instance_index_doc(instance: "RedisInstance") -> bool:
         inst_dict = instance.model_dump(mode="json")
         if inst_dict.get("connection_url"):
             inst_dict["connection_url"] = encrypt_secret(inst_dict["connection_url"])
-        if inst_dict.get("admin_password"):
-            inst_dict["admin_password"] = encrypt_secret(inst_dict["admin_password"])
-
         # Index timestamps (numeric) but keep ISO strings inside 'data'
         created_ts = _to_epoch(inst_dict.get("created_at"))
         updated_ts = _to_epoch(inst_dict.get("updated_at"))
@@ -639,7 +465,33 @@ async def delete_instance_index_doc(instance_id: str) -> None:
         return
 
 
+_PERSISTED_INSTANCE_TYPES = {
+    RedisInstanceType.oss_single,
+    RedisInstanceType.oss_cluster,
+}
+
+
+def _validate_persistable_instances(instances: List[RedisInstance]) -> None:
+    """Reject target types that cannot be stored as formal diagnostic targets."""
+    unsupported = sorted(
+        {instance.instance_type.value for instance in instances}
+        - {instance_type.value for instance_type in _PERSISTED_INSTANCE_TYPES}
+    )
+    if unsupported:
+        rendered = ", ".join(unsupported)
+        raise ValueError(
+            "Formal Redis instance persistence only supports oss_single and oss_cluster; "
+            f"got: {rendered}"
+        )
+
+
 async def save_instances(instances: List[RedisInstance]) -> bool:
+    """Persist only protocol-classified OSS instances as formal targets."""
+    _validate_persistable_instances(instances)
+    return await _save_instances(instances)
+
+
+async def _save_instances(instances: List[RedisInstance]) -> bool:
     """Persist instances using per-instance hash docs + search index (no legacy list)."""
     try:
         client = get_redis_client()
@@ -739,12 +591,10 @@ async def get_session_instances(thread_id: str) -> List[RedisInstance]:
         for inst_data in data:
             if inst_data.get("connection_url"):
                 inst_data["connection_url"] = get_secret_value(inst_data["connection_url"])
-            if inst_data.get("admin_password"):
-                inst_data["admin_password"] = get_secret_value(inst_data["admin_password"])
             out.append(RedisInstance(**inst_data))
         return out
-    except Exception as e:
-        logger.exception("Failed to get session instances for %s: %s", thread_id, e)
+    except Exception:
+        logger.exception("Failed to get session instances for %s", thread_id)
         return []
 
 
@@ -764,8 +614,6 @@ async def add_session_instance(thread_id: str, instance: RedisInstance) -> bool:
             d = inst.model_dump(mode="json")
             if d.get("connection_url"):
                 d["connection_url"] = encrypt_secret(d["connection_url"])
-            if d.get("admin_password"):
-                d["admin_password"] = encrypt_secret(d["admin_password"])
             items.append(d)
         await redis_client.set(RedisKeys.thread_instances(thread_id), json.dumps(items), ex=3600)
         return True
@@ -804,13 +652,16 @@ async def create_instance(
     user_id: Optional[str] = None,
     repo_url: Optional[str] = None,
     notes: Optional[str] = None,
-    instance_type: "RedisInstanceType" = RedisInstanceType.unknown,
+    instance_type: "RedisInstanceType | str | None" = None,
 ) -> RedisInstance:
     """Create and persist a new instance for dynamic agent flows."""
     try:
+        from .redis_topology import classify_redis_endpoint
+
         instances = await get_instances()
         if any(inst.name == name for inst in instances):
             raise ValueError(f"Instance with name '{name}' already exists")
+        classified_type = await classify_redis_endpoint(connection_url, instance_type)
         instance_id = f"redis-{environment}-{ULID()}"
         new_inst = RedisInstance(
             id=instance_id,
@@ -823,7 +674,7 @@ async def create_instance(
             notes=notes,
             created_by=created_by,
             user_id=user_id,
-            instance_type=instance_type,
+            instance_type=classified_type,
         )
         instances.append(new_inst)
         if not await save_instances(instances):
@@ -855,9 +706,6 @@ async def get_instance_by_id(instance_id: str) -> Optional[RedisInstance]:
         inst_data = json.loads(data)
         if inst_data.get("connection_url"):
             inst_data["connection_url"] = get_secret_value(inst_data["connection_url"])
-        if inst_data.get("admin_password"):
-            inst_data["admin_password"] = get_secret_value(inst_data["admin_password"])
-
         instance = RedisInstance(**inst_data)
         # Infrastructure authorization chokepoint: a denied principal gets None (the
         # existing not-found path), so no caller can obtain an instance it may not access.
@@ -866,8 +714,8 @@ async def get_instance_by_id(instance_id: str) -> Optional[RedisInstance]:
         if not await assert_target_allowed(TargetRef.from_instance(instance)):
             return None
         return instance
-    except Exception as e:
-        logger.exception("Failed to get instance by ID %s: %s", instance_id, e)
+    except Exception:
+        _record_persisted_instance_load_error("direct lookup")
         return None
 
 
@@ -903,12 +751,9 @@ async def get_instance_by_name(instance_name: str) -> Optional[RedisInstance]:
         inst_data = json.loads(raw)
         if inst_data.get("connection_url"):
             inst_data["connection_url"] = get_secret_value(inst_data["connection_url"])
-        if inst_data.get("admin_password"):
-            inst_data["admin_password"] = get_secret_value(inst_data["admin_password"])
-
         return RedisInstance(**inst_data)
-    except Exception as e:
-        logger.exception("Failed to get instance by name %s: %s", instance_name, e)
+    except Exception:
+        _record_persisted_instance_load_error("name lookup")
         return None
 
 

@@ -69,11 +69,6 @@ After calling any of these, you MUST:
 | `redis_sre_get_related_knowledge_fragments()` | Get nearby chunks around a document fragment |
 | `redis_sre_get_pipeline_status()` | Show pipeline artifacts and recent ingestion state |
 | `redis_sre_get_pipeline_batch()` | Show manifest and ingestion details for a batch |
-| `redis_sre_list_support_packages()` | List uploaded support packages |
-| `redis_sre_get_support_package_info()` | Get metadata for a support package |
-| `redis_sre_upload_support_package()` | Upload a support package |
-| `redis_sre_extract_support_package()` | Extract a support package |
-| `redis_sre_delete_support_package()` | Delete a support package |
 | `redis_sre_search_support_tickets()` | Search support-ticket docs only |
 | `redis_sre_get_support_ticket()` | Get full support-ticket content by ticket id |
 | `redis_sre_cache_stats()` | Show tool cache statistics |
@@ -144,7 +139,6 @@ while True:
 - Use fragment tools when you need the full document or nearby chunk context for a search hit
 - Use task-backed pipeline tools for scrape/ingest/prepare/cleanup workflows
 - Use `redis_sre_get_pipeline_status()` and `redis_sre_get_pipeline_batch()` for ingestion inspection
-- Use support-package tools to upload, inspect, and extract Redis Enterprise diagnostics
 - Use `redis_sre_search_support_tickets()` and `redis_sre_get_support_ticket()` for ticket-only retrieval
 - Use `redis_sre_cache_stats()` to inspect cache state and `redis_sre_cache_clear()` to clear cached tool outputs
 - Use `redis_sre_version()` for basic package/version inspection
@@ -556,12 +550,11 @@ async def redis_sre_query(
     query: str,
     instance_id: Optional[str] = None,
     cluster_id: Optional[str] = None,
-    support_package_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     agent: str = "auto",
     user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create a routed query task with thread continuation and support-package targeting."""
+    """Create a routed query task with thread continuation and target selection."""
     from redis_sre_agent.core.query_helpers import queue_query_task_helper
 
     logger.info("MCP query request: %s...", query[:100])
@@ -571,7 +564,6 @@ async def redis_sre_query(
             query=query,
             instance_id=instance_id,
             cluster_id=cluster_id,
-            support_package_id=support_package_id,
             thread_id=thread_id,
             agent=agent,
             user_id=user_id,
@@ -598,6 +590,9 @@ async def redis_sre_list_clusters(
     """List configured Redis clusters with optional filtering."""
     from redis_sre_agent.core.cluster_helpers import list_clusters_helper
 
+    if cluster_type is not None and cluster_type != "oss_cluster":
+        return {"error": "cluster_type must be oss_cluster", "status": "failed"}
+
     return await list_clusters_helper(
         environment=environment,
         status=status,
@@ -622,11 +617,7 @@ async def redis_sre_create_cluster(
     name: str,
     environment: str,
     description: str,
-    cluster_type: str = "unknown",
     notes: Optional[str] = None,
-    admin_url: Optional[str] = None,
-    admin_username: Optional[str] = None,
-    admin_password: Optional[str] = None,
     status: Optional[str] = None,
     version: Optional[str] = None,
     last_checked: Optional[str] = None,
@@ -641,11 +632,7 @@ async def redis_sre_create_cluster(
             name=name,
             environment=environment,
             description=description,
-            cluster_type=cluster_type,
             notes=notes,
-            admin_url=admin_url,
-            admin_username=admin_username,
-            admin_password=admin_password,
             status=status,
             version=version,
             last_checked=last_checked,
@@ -660,13 +647,9 @@ async def redis_sre_create_cluster(
 async def redis_sre_update_cluster(
     cluster_id: str,
     name: Optional[str] = None,
-    cluster_type: Optional[str] = None,
     environment: Optional[str] = None,
     description: Optional[str] = None,
     notes: Optional[str] = None,
-    admin_url: Optional[str] = None,
-    admin_username: Optional[str] = None,
-    admin_password: Optional[str] = None,
     status: Optional[str] = None,
     version: Optional[str] = None,
     last_checked: Optional[str] = None,
@@ -680,13 +663,9 @@ async def redis_sre_update_cluster(
         return await update_cluster_helper(
             cluster_id,
             name=name,
-            cluster_type=cluster_type,
             environment=environment,
             description=description,
             notes=notes,
-            admin_url=admin_url,
-            admin_username=admin_username,
-            admin_password=admin_password,
             status=status,
             version=version,
             last_checked=last_checked,
@@ -706,20 +685,6 @@ async def redis_sre_delete_cluster(cluster_id: str, confirm: bool = False) -> Di
         return await delete_cluster_helper(cluster_id, confirm=confirm)
     except Exception as e:
         return {"error": str(e), "id": cluster_id, "status": "failed"}
-
-
-@mcp.tool()
-async def redis_sre_backfill_instance_links(
-    dry_run: bool = False,
-    force: bool = False,
-) -> Dict[str, Any]:
-    """Backfill cluster links for existing instance records."""
-    from redis_sre_agent.core.cluster_helpers import backfill_instance_links_helper
-
-    try:
-        return await backfill_instance_links_helper(dry_run=dry_run, force=force)
-    except Exception as e:
-        return {"error": str(e), "status": "failed"}
 
 
 @mcp.tool()
@@ -1358,196 +1323,6 @@ def redis_sre_scaffold_skill_package(
             "target_dir": target_dir,
             "force": force,
             "status": "failed",
-        }
-
-
-@mcp.tool()
-async def redis_sre_list_support_packages(limit: int = 100) -> Dict[str, Any]:
-    """List uploaded support packages.
-
-    Args:
-        limit: Maximum number of packages to return.
-
-    Returns:
-        packages: Serialized package metadata
-        total: Number of returned packages
-    """
-    from redis_sre_agent.core.support_package_helpers import get_support_package_manager
-
-    logger.info("MCP list_support_packages: limit=%s", limit)
-
-    try:
-        limit = max(1, limit)
-        manager = get_support_package_manager()
-        packages = await manager.list_packages()
-        return {
-            "packages": [pkg.model_dump(mode="json") for pkg in packages[:limit]],
-            "total": min(len(packages), limit),
-            "limit": limit,
-        }
-    except Exception as e:
-        logger.error("List support packages failed: %s", e)
-        return {
-            "error": str(e),
-            "packages": [],
-            "total": 0,
-            "limit": limit,
-        }
-
-
-@mcp.tool()
-async def redis_sre_get_support_package_info(package_id: str) -> Dict[str, Any]:
-    """Get information about a support package.
-
-    Args:
-        package_id: Support package id.
-
-    Returns:
-        Serialized metadata plus extraction state.
-    """
-    from redis_sre_agent.core.support_package_helpers import get_support_package_manager
-
-    logger.info("MCP get_support_package_info: package_id=%s", package_id)
-
-    try:
-        manager = get_support_package_manager()
-        metadata = await manager.get_metadata(package_id)
-        if not metadata:
-            return {
-                "package_id": package_id,
-                "status": "not_found",
-                "error": "Package not found",
-            }
-
-        payload = metadata.model_dump(mode="json")
-        payload["is_extracted"] = await manager.is_extracted(package_id)
-        return payload
-    except Exception as e:
-        logger.error("Get support package info failed: %s", e)
-        return {
-            "package_id": package_id,
-            "status": "failed",
-            "error": str(e),
-        }
-
-
-@mcp.tool()
-async def redis_sre_upload_support_package(
-    file_path: str, package_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """Upload a support package.
-
-    Args:
-        file_path: Local path to a `.tar.gz` support package.
-        package_id: Optional custom package id.
-
-    Returns:
-        package_id: Stored package id
-        filename: Original filename
-        status: Upload status
-    """
-    from pathlib import Path
-
-    from redis_sre_agent.core.support_package_helpers import get_support_package_manager
-
-    logger.info("MCP upload_support_package: file_path=%s, package_id=%s", file_path, package_id)
-
-    try:
-        source_path = Path(file_path)
-        if not source_path.exists():
-            return {
-                "file_path": file_path,
-                "status": "failed",
-                "error": f"File not found: {file_path}",
-            }
-
-        manager = get_support_package_manager()
-        result_id = await manager.upload(source_path, package_id=package_id)
-        return {
-            "package_id": result_id,
-            "filename": source_path.name,
-            "status": "uploaded",
-        }
-    except Exception as e:
-        logger.error("Upload support package failed: %s", e)
-        return {
-            "file_path": file_path,
-            "status": "failed",
-            "error": str(e),
-        }
-
-
-@mcp.tool()
-async def redis_sre_extract_support_package(package_id: str) -> Dict[str, Any]:
-    """Extract a support package.
-
-    Args:
-        package_id: Support package id.
-
-    Returns:
-        package_id: Support package id
-        path: Extracted directory
-        status: Extraction status
-    """
-    from redis_sre_agent.core.support_package_helpers import get_support_package_manager
-
-    logger.info("MCP extract_support_package: package_id=%s", package_id)
-
-    try:
-        manager = get_support_package_manager()
-        extract_path = await manager.extract(package_id)
-        return {
-            "package_id": package_id,
-            "path": str(extract_path),
-            "status": "extracted",
-        }
-    except Exception as e:
-        logger.error("Extract support package failed: %s", e)
-        return {
-            "package_id": package_id,
-            "status": "failed",
-            "error": str(e),
-        }
-
-
-@mcp.tool()
-async def redis_sre_delete_support_package(
-    package_id: str, confirm: bool = False
-) -> Dict[str, Any]:
-    """Delete a support package.
-
-    Args:
-        package_id: Support package id.
-        confirm: Explicit confirmation for deletion.
-
-    Returns:
-        package_id: Support package id
-        status: Delete status
-    """
-    from redis_sre_agent.core.support_package_helpers import get_support_package_manager
-
-    logger.info("MCP delete_support_package: package_id=%s confirm=%s", package_id, confirm)
-
-    if not confirm:
-        return {
-            "package_id": package_id,
-            "status": "failed",
-            "error": "Deletion requires confirm=true",
-        }
-
-    try:
-        manager = get_support_package_manager()
-        await manager.delete(package_id)
-        return {
-            "package_id": package_id,
-            "status": "deleted",
-        }
-    except Exception as e:
-        logger.error("Delete support package failed: %s", e)
-        return {
-            "package_id": package_id,
-            "status": "failed",
-            "error": str(e),
         }
 
 
@@ -2732,7 +2507,7 @@ async def redis_sre_list_instances(
         environment: Filter by environment (development, staging, production)
         usage: Filter by usage type (cache, analytics, session, queue, custom)
         status: Filter by status (healthy, unhealthy, unknown)
-        instance_type: Filter by type (oss_single, oss_cluster, redis_enterprise, redis_cloud)
+        instance_type: Filter by type (oss_single or oss_cluster)
         search: Search by instance name (partial match supported)
         limit: Maximum number of results (default 100)
 
@@ -2740,6 +2515,9 @@ async def redis_sre_list_instances(
         Dictionary with filtered list of instance information and total count
     """
     from redis_sre_agent.core.instances import query_instances
+
+    if instance_type is not None and instance_type not in {"oss_single", "oss_cluster"}:
+        return {"error": "instance_type must be oss_single or oss_cluster", "status": "failed"}
 
     logger.info(
         f"MCP list_instances request: env={environment}, usage={usage}, "
@@ -2852,6 +2630,8 @@ async def redis_sre_create_instance(
     description: str,
     repo_url: Optional[str] = None,
     user_id: Optional[str] = None,
+    instance_type: Optional[str] = None,
+    cluster_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new Redis instance configuration.
 
@@ -2871,11 +2651,13 @@ async def redis_sre_create_instance(
     Returns:
         Dictionary with the created instance ID and status
     """
+    from redis_sre_agent.core.instance_mutation_helpers import _validate_instance_cluster_link
     from redis_sre_agent.core.instances import (
         RedisInstance,
         get_instances,
         save_instances,
     )
+    from redis_sre_agent.core.redis_topology import classify_redis_endpoint
 
     logger.info(f"MCP create_instance: {name}")
 
@@ -2902,6 +2684,11 @@ async def redis_sre_create_instance(
                 "status": "failed",
             }
 
+        classified_type = await classify_redis_endpoint(connection_url, instance_type)
+        linked_cluster_id = await _validate_instance_cluster_link(
+            cluster_id=cluster_id,
+            instance_type=classified_type.value,
+        )
         instance_id = f"redis-{environment.lower()}-{ULID()}"
         new_instance = RedisInstance(
             id=instance_id,
@@ -2911,7 +2698,8 @@ async def redis_sre_create_instance(
             usage=usage.lower(),
             description=description,
             repo_url=repo_url,
-            instance_type="unknown",  # Will be auto-detected on first connection
+            instance_type=classified_type,
+            cluster_id=linked_cluster_id,
         )
 
         instances.append(new_instance)
@@ -2945,14 +2733,7 @@ async def redis_sre_update_instance(
     monitoring_identifier: Optional[str] = None,
     logging_identifier: Optional[str] = None,
     instance_type: Optional[str] = None,
-    admin_url: Optional[str] = None,
-    admin_username: Optional[str] = None,
-    admin_password: Optional[str] = None,
     cluster_id: Optional[str] = None,
-    redis_cloud_subscription_id: Optional[int] = None,
-    redis_cloud_database_id: Optional[int] = None,
-    redis_cloud_subscription_type: Optional[str] = None,
-    redis_cloud_database_name: Optional[str] = None,
     status: Optional[str] = None,
     version: Optional[str] = None,
     memory: Optional[str] = None,
@@ -2979,14 +2760,7 @@ async def redis_sre_update_instance(
             monitoring_identifier=monitoring_identifier,
             logging_identifier=logging_identifier,
             instance_type=instance_type,
-            admin_url=admin_url,
-            admin_username=admin_username,
-            admin_password=admin_password,
             cluster_id=cluster_id,
-            redis_cloud_subscription_id=redis_cloud_subscription_id,
-            redis_cloud_database_id=redis_cloud_database_id,
-            redis_cloud_subscription_type=redis_cloud_subscription_type,
-            redis_cloud_database_name=redis_cloud_database_name,
             status=status,
             version=version,
             memory=memory,

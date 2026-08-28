@@ -13,7 +13,7 @@ from redis_sre_agent.core.targets import (
     get_target_bindings_from_context,
 )
 
-TurnScopeKind = Literal["zero_scope", "target_bindings", "support_package"]
+TurnScopeKind = Literal["zero_scope", "target_bindings"]
 TurnScopeResolutionPolicy = Literal[
     "allow_zero_scope",
     "require_target",
@@ -44,7 +44,6 @@ class TurnScope(BaseModel):
     seed_hints: dict[str, Any] = Field(default_factory=dict)
     resolution_policy: TurnScopeResolutionPolicy = "allow_zero_scope"
     automation_mode: TurnScopeAutomationMode = "interactive"
-    support_package_context: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def target_count(self) -> int:
@@ -78,11 +77,6 @@ class TurnScope(BaseModel):
         payload = context or {}
         attached_target_handles = get_attached_target_handles_from_context(payload)
         bindings = get_target_bindings_from_context(payload)
-        support_package_context = {
-            key: payload[key]
-            for key in ("support_package_id", "support_package_path")
-            if payload.get(key)
-        }
         automated = bool(payload.get("automated"))
         resolution_policy = str(payload.get("resolution_policy") or "").strip() or None
         if resolution_policy not in {
@@ -95,8 +89,6 @@ class TurnScope(BaseModel):
 
         if bindings:
             scope_kind: TurnScopeKind = "target_bindings"
-        elif support_package_context:
-            scope_kind = "support_package"
         else:
             scope_kind = "zero_scope"
 
@@ -116,7 +108,6 @@ class TurnScope(BaseModel):
             seed_hints=dict(seed_hints or {}),
             resolution_policy=resolution_policy,
             automation_mode="automated" if automated else "interactive",
-            support_package_context=support_package_context,
         )
 
     def to_thread_context(self) -> dict[str, Any]:
@@ -135,7 +126,6 @@ class TurnScope(BaseModel):
                 binding.target_handle for binding in self.bindings
             ]
             context["target_bindings"] = [binding.public_dump() for binding in self.bindings]
-        context.update(self.support_package_context)
         return context
 
 
@@ -145,7 +135,6 @@ def build_legacy_target_scope_adapter(
     cluster_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     session_id: Optional[str] = None,
-    support_package_context: Optional[Dict[str, Any]] = None,
     automation_mode: TurnScopeAutomationMode = "interactive",
     resolution_policy: TurnScopeResolutionPolicy = "allow_zero_scope",
     prompt_context: Optional[Dict[str, Any]] = None,
@@ -182,15 +171,8 @@ def build_legacy_target_scope_adapter(
             )
         )
 
-    normalized_support_package_context = {
-        key: value
-        for key, value in (support_package_context or {}).items()
-        if _coerce_optional_str(value) is not None
-    }
     if bindings:
         scope_kind: TurnScopeKind = "target_bindings"
-    elif normalized_support_package_context:
-        scope_kind = "support_package"
     else:
         scope_kind = "zero_scope"
 
@@ -210,7 +192,6 @@ def build_legacy_target_scope_adapter(
         seed_hints=combined_seed_hints,
         resolution_policy=resolution_policy,
         automation_mode=automation_mode,
-        support_package_context=normalized_support_package_context,
     )
     context = scope.to_thread_context()
     if include_legacy_ids:

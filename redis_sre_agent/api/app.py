@@ -20,14 +20,10 @@ from redis_sre_agent.api.memory import router as memory_router
 from redis_sre_agent.api.metrics import router as metrics_router
 from redis_sre_agent.api.middleware import setup_middleware
 from redis_sre_agent.api.schedules import router as schedules_router
-from redis_sre_agent.api.support_package import router as support_package_router
 from redis_sre_agent.api.tasks import router as tasks_api_router
 from redis_sre_agent.api.threads import router as threads_router
 from redis_sre_agent.api.websockets import router as websockets_router
 from redis_sre_agent.core.config import settings
-from redis_sre_agent.core.migrations.instances_to_clusters import (
-    run_instances_to_clusters_migration,
-)
 from redis_sre_agent.core.redis import initialize_redis
 from redis_sre_agent.core.targets import sync_target_catalog_from_authoritative_records
 from redis_sre_agent.observability.tracing import setup_tracing as setup_base_tracing
@@ -109,15 +105,6 @@ async def lifespan(app: FastAPI):
 
         # Store startup state for agent status checks
         _app_startup_state = redis_status
-
-        # Startup migration: backfill instance->cluster links (best effort).
-        try:
-            migration_summary = await run_instances_to_clusters_migration(source="api_startup")
-            _app_startup_state["instance_cluster_migration"] = migration_summary.to_dict()
-            logger.info("Instance-cluster backfill summary: %s", migration_summary.to_dict())
-        except Exception as e:
-            logger.warning("Instance-cluster startup migration failed (continuing): %s", e)
-            _app_startup_state["instance_cluster_migration"] = {"error": str(e)}
 
         try:
             authoritative_target_docs = await sync_target_catalog_from_authoritative_records()
@@ -229,11 +216,6 @@ app.include_router(memory_router, prefix="/api/v1", tags=["Memory"], dependencie
 
 app.include_router(schedules_router, tags=["Schedules"], dependencies=_auth)
 app.include_router(websockets_router, prefix="/api/v1", tags=["WebSockets"])
-app.include_router(
-    support_package_router, prefix="/api/v1", tags=["Support Packages"], dependencies=_auth
-)
-
-
 if __name__ == "__main__":
     import uvicorn
 

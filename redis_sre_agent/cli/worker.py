@@ -175,18 +175,6 @@ def start(concurrency: int):
                     logger.error("Knowledge-pack auto-load failed: %s", e)
                     # Continue anyway - worker startup does not depend on the pack
 
-        # Run startup migration for legacy instance->cluster links (idempotent).
-        try:
-            from redis_sre_agent.core.migrations.instances_to_clusters import (
-                run_instances_to_clusters_migration,
-            )
-
-            migration_summary = await run_instances_to_clusters_migration(source="worker_startup")
-            logger.info("Instance-cluster backfill summary: %s", migration_summary.to_dict())
-        except Exception as e:
-            log_cli_exception(__name__, "worker CLI command failed", e)
-            logger.warning("Instance-cluster startup migration failed (continuing): %s", e)
-
         try:
             # Register tasks first (support both sync and async implementations)
             reg = register_sre_tasks()

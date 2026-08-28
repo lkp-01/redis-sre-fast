@@ -124,8 +124,8 @@ def build_safety_fact_corrector(
             content=(
                 "You are a Redis SRE Corrector. Edit ONLY the given response to fix safety and factual errors.\n"
                 "- Do not add new topics or steps.\n"
-                "- Remove fabricated commands; prefer documented rladmin, redis-cli, or Admin REST API curl examples.\n"
-                "- If you cannot confirm an exact command/API syntax via knowledge search, remove it and add a short caution.\n"
+                "- Remove fabricated commands; prefer documented Redis protocol commands.\n"
+                "- If you cannot confirm an exact command syntax via knowledge search, remove it and add a short caution.\n"
                 "- If the instance appears persistent, do NOT recommend eviction or destructive changes; remove unsafe steps.\n"
                 "- If URLs are broken, remove or replace with a validated doc URL.\n"
                 "Return the edited text and a short list of edits applied."

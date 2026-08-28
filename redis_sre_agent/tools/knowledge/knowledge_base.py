@@ -153,14 +153,6 @@ class KnowledgeBaseToolProvider(ToolProvider):
                                 "'documentation')."
                             ),
                         },
-                        "product_labels": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "Redis product labels (e.g., 'Redis Enterprise Software', "
-                                "'Redis Cloud', 'Redis CE and Stack')"
-                            ),
-                        },
                     },
                     "required": ["title", "content", "source", "category"],
                 },

@@ -1,4 +1,4 @@
-"""Redis documentation scraper for OSS and Enterprise docs."""
+"""Redis OSS documentation scraper with an explicit source allowlist."""
 
 import asyncio
 import logging
@@ -29,8 +29,7 @@ class RedisDocsScraper(BaseScraper):
         # Default configuration
         self.config = {
             "oss_base_url": "https://redis.io/docs/",
-            "enterprise_base_url": "https://docs.redis.com/latest/",
-            "max_pages": 500,  # Increased for comprehensive scraping
+            "max_pages": 500,
             "delay_between_requests": 0.5,  # Faster but still respectful
             "timeout": 30,
             "latest_only": False,  # If True, skip versioned docs (e.g., /7.x/)
@@ -82,7 +81,7 @@ class RedisDocsScraper(BaseScraper):
         return "redis_documentation"
 
     async def scrape(self) -> List[ScrapedDocument]:
-        """Scrape Redis OSS and Enterprise documentation."""
+        """Scrape the supported Redis OSS documentation sections."""
         documents = []
         self._visited_urls = set()
         self._pages_scraped = 0
@@ -92,15 +91,8 @@ class RedisDocsScraper(BaseScraper):
         ) as session:
             self.session = session
 
-            # Scrape OSS documentation
             self.logger.info("Scraping Redis OSS documentation")
-            oss_docs = await self._scrape_oss_docs()
-            documents.extend(oss_docs)
-
-            # Scrape Enterprise documentation
-            self.logger.info("Scraping Redis Enterprise documentation")
-            enterprise_docs = await self._scrape_enterprise_docs()
-            documents.extend(enterprise_docs)
+            documents.extend(await self._scrape_oss_docs())
 
         self.logger.info(f"Scraped {len(documents)} Redis documentation pages")
         return documents
@@ -125,78 +117,16 @@ class RedisDocsScraper(BaseScraper):
         base_url = self.config["oss_base_url"]
         documents = []
 
-        # Comprehensive OSS documentation sections
+        # Keep the web source bounded to standard Redis protocol documentation.
         oss_sections = [
             ("get-started/", DocumentType.TUTORIAL, SeverityLevel.HIGH),
             ("connect/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
             ("data-types/", DocumentType.REFERENCE, SeverityLevel.MEDIUM),
             ("commands/", DocumentType.REFERENCE, SeverityLevel.MEDIUM),
             ("management/", DocumentType.RUNBOOK, SeverityLevel.HIGH),
-            ("operate/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
-            ("latest/operate/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
-            # Redis Enterprise Software CLI utilities (rladmin, redis-cli, etc.)
-            (
-                "latest/operate/rs/references/cli-utilities/",
-                DocumentType.REFERENCE,
-                SeverityLevel.CRITICAL,
-            ),
-            # Redis Enterprise Software operations
-            ("latest/operate/rs/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
-            # Deep technical sections
-            ("latest/operate/oss_and_stack/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
-            (
-                "latest/operate/oss_and_stack/stack-with-enterprise/",
-                DocumentType.RUNBOOK,
-                SeverityLevel.CRITICAL,
-            ),
-            (
-                "latest/operate/oss_and_stack/stack-with-enterprise/search/",
-                DocumentType.REFERENCE,
-                SeverityLevel.HIGH,
-            ),
-            (
-                "latest/operate/oss_and_stack/stack-with-enterprise/json/",
-                DocumentType.REFERENCE,
-                SeverityLevel.HIGH,
-            ),
-            (
-                "latest/operate/oss_and_stack/stack-with-enterprise/timeseries/",
-                DocumentType.REFERENCE,
-                SeverityLevel.MEDIUM,
-            ),
-            (
-                "latest/operate/oss_and_stack/stack-with-enterprise/bloom/",
-                DocumentType.REFERENCE,
-                SeverityLevel.MEDIUM,
-            ),
-            (
-                "latest/operate/oss_and_stack/stack-with-enterprise/graph/",
-                DocumentType.REFERENCE,
-                SeverityLevel.MEDIUM,
-            ),
-            ("latest/operate/oss_and_stack/management/", DocumentType.RUNBOOK, SeverityLevel.HIGH),
-            (
-                "latest/operate/oss_and_stack/management/admin/",
-                DocumentType.RUNBOOK,
-                SeverityLevel.CRITICAL,
-            ),
-            (
-                "latest/operate/oss_and_stack/management/config/",
-                DocumentType.RUNBOOK,
-                SeverityLevel.CRITICAL,
-            ),
-            (
-                "latest/operate/oss_and_stack/management/optimization/",
-                DocumentType.RUNBOOK,
-                SeverityLevel.HIGH,
-            ),
-            (
-                "latest/operate/oss_and_stack/management/security/",
-                DocumentType.RUNBOOK,
-                SeverityLevel.CRITICAL,
-            ),
-            ("latest/integrate/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
-            ("latest/develop/", DocumentType.DOCUMENTATION, SeverityLevel.MEDIUM),
+            ("operate/oss_and_stack/", DocumentType.RUNBOOK, SeverityLevel.CRITICAL),
+            ("develop/", DocumentType.DOCUMENTATION, SeverityLevel.MEDIUM),
+            ("integrate/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
         ]
 
         for section, doc_type, severity in oss_sections:
@@ -217,42 +147,6 @@ class RedisDocsScraper(BaseScraper):
 
             except Exception as e:
                 self.logger.error(f"Failed to scrape OSS section {section}: {e}")
-                continue
-
-        return documents
-
-    async def _scrape_enterprise_docs(self) -> List[ScrapedDocument]:
-        """Scrape Redis Enterprise documentation."""
-        base_url = self.config["enterprise_base_url"]
-        documents = []
-
-        # Key Enterprise documentation sections
-        enterprise_sections = [
-            ("rs/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
-            ("rc/", DocumentType.DOCUMENTATION, SeverityLevel.HIGH),
-            ("ri/", DocumentType.DOCUMENTATION, SeverityLevel.MEDIUM),
-            ("kubernetes/", DocumentType.RUNBOOK, SeverityLevel.HIGH),
-            ("modules/", DocumentType.REFERENCE, SeverityLevel.MEDIUM),
-        ]
-
-        for section, doc_type, severity in enterprise_sections:
-            section_url = urljoin(base_url, section)
-
-            # For enterprise, base_url already uses /latest/, but still guard
-            if self.config.get("latest_only") and self._is_versioned_url(section_url):
-                continue
-
-            try:
-                section_docs = await self._scrape_section(
-                    section_url, DocumentCategory.ENTERPRISE, doc_type, severity, max_depth=4
-                )
-                documents.extend(section_docs)
-
-                # Rate limiting
-                await asyncio.sleep(self.config["delay_between_requests"])
-
-            except Exception as e:
-                self.logger.error(f"Failed to scrape Enterprise section {section}: {e}")
                 continue
 
         return documents
@@ -492,30 +386,18 @@ class RedisDocsScraper(BaseScraper):
                 if self.config.get("latest_only") and self._is_versioned_url(full_url):
                     continue
 
-                # Include documentation paths specifically
+                allowed_paths = (
+                    "/docs/get-started/",
+                    "/docs/connect/",
+                    "/docs/data-types/",
+                    "/docs/commands/",
+                    "/docs/management/",
+                    "/docs/operate/oss_and_stack/",
+                    "/docs/develop/",
+                    "/docs/integrate/",
+                )
                 if (
-                    any(
-                        include in full_url
-                        for include in [
-                            "/docs/",
-                            "/operate/",
-                            "/develop/",
-                            "/integrate/",
-                            "/commands/",
-                            "/data-types/",
-                            "/management/",
-                            "/stack-with-enterprise/",
-                            "/search/",
-                            "/json/",
-                            "/timeseries/",
-                            "/bloom/",
-                            "/graph/",
-                            "/admin/",
-                            "/config/",
-                            "/optimization/",
-                            "/security/",
-                        ]
-                    )
+                    any(path in full_url for path in allowed_paths)
                     and full_url not in links
                     and full_url != base_url
                 ):

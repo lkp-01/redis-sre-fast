@@ -211,12 +211,6 @@ def _build_source_revisions(repo_root: Path, repo_sha: str | None) -> dict[str, 
         if redis_docs_sha:
             source_revisions["redis_docs_commit"] = redis_docs_sha
 
-    redis_cloud_api_spec = repo_root / "source_documents" / "cloud" / "redis-cloud-api-spec.json"
-    if redis_cloud_api_spec.exists():
-        source_revisions["redis_cloud_api_source"] = str(
-            redis_cloud_api_spec.relative_to(repo_root)
-        )
-
     return source_revisions
 
 
