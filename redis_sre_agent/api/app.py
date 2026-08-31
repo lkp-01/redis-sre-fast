@@ -11,6 +11,8 @@ from redis_sre_agent import __version__
 from redis_sre_agent.api.auth import require_auth
 from redis_sre_agent.api.auth import router as auth_router
 from redis_sre_agent.api.clusters import router as clusters_router
+from redis_sre_agent.api.evals import EvalControlPlaneServices
+from redis_sre_agent.api.evals import router as evals_router
 from redis_sre_agent.api.feedback import list_router as feedback_list_router
 from redis_sre_agent.api.feedback import router as feedback_router
 from redis_sre_agent.api.health import router as health_router
@@ -26,6 +28,10 @@ from redis_sre_agent.api.websockets import router as websockets_router
 from redis_sre_agent.core.config import settings
 from redis_sre_agent.core.redis import initialize_redis
 from redis_sre_agent.core.targets import sync_target_catalog_from_authoritative_records
+from redis_sre_agent.evaluation.control_plane.comparison import EvalComparisonService
+from redis_sre_agent.evaluation.control_plane.manager import EvalRunManager
+from redis_sre_agent.evaluation.control_plane.registry import SuiteRegistry
+from redis_sre_agent.evaluation.control_plane.store import FileEvalRunStore
 from redis_sre_agent.observability.tracing import setup_tracing as setup_base_tracing
 from redis_sre_agent.tools.mcp.pool import MCPConnectionPool
 
@@ -86,6 +92,27 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting up {settings.app_name}...")
 
     global _app_startup_state
+
+    app.state.eval_control_plane = None
+    if settings.eval_control_enabled:
+        try:
+            eval_registry = SuiteRegistry(settings.eval_suite_root)
+            eval_store = FileEvalRunStore(settings.eval_run_root)
+            eval_manager = EvalRunManager(
+                eval_registry,
+                eval_store,
+                repo_root=settings.eval_repo_root,
+            )
+            await eval_manager.recover()
+            app.state.eval_control_plane = EvalControlPlaneServices(
+                registry=eval_registry,
+                store=eval_store,
+                manager=eval_manager,
+                comparison=EvalComparisonService(eval_store),
+            )
+            logger.info("Eval control plane initialized: %s", eval_store.root)
+        except Exception as e:
+            logger.exception("Eval control plane initialization failed: %s", e)
 
     try:
         # Initialize Redis infrastructure
@@ -158,6 +185,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down FastAPI application...")
 
+    eval_services = getattr(app.state, "eval_control_plane", None)
+    if eval_services is not None:
+        await eval_services.manager.shutdown()
+
     # Shutdown MCP connection pool
     try:
         mcp_pool = MCPConnectionPool.get_instance()
@@ -213,6 +244,7 @@ app.include_router(tasks_api_router, prefix="/api/v1", tags=["Tasks"], dependenc
 app.include_router(feedback_router, dependencies=_auth)
 app.include_router(feedback_list_router, dependencies=_auth)
 app.include_router(memory_router, prefix="/api/v1", tags=["Memory"], dependencies=_auth)
+app.include_router(evals_router, dependencies=_auth)
 
 app.include_router(schedules_router, tags=["Schedules"], dependencies=_auth)
 app.include_router(websockets_router, prefix="/api/v1", tags=["WebSockets"])

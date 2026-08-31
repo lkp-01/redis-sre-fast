@@ -17,6 +17,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from opentelemetry import trace
 
+from ...core.llm_helpers import bind_structured_output
 from ...core.llm_request_guard import GuardedMemoizeLLMProxy, guarded_ainvoke
 from ..helpers import ensure_tool_bound_llm, log_preflight_messages, sanitize_messages_for_llm
 from ..models import CorrectionResult
@@ -110,7 +111,7 @@ def build_safety_fact_corrector(
 
     async def synth_node(state: CorrectorState) -> CorrectorState:
         # Final strict edit-only synthesis
-        structured_llm = base_llm.with_structured_output(CorrectionResult)
+        structured_llm = bind_structured_output(base_llm, CorrectionResult)
         memoized_synth_llm = (
             GuardedMemoizeLLMProxy(
                 structured_llm,

@@ -31,7 +31,7 @@ Programmatic registration:
 
 import importlib
 import logging
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -40,6 +40,22 @@ from openai import AsyncOpenAI
 from redis_sre_agent.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def bind_structured_output(llm: BaseChatModel, schema: Any) -> Any:
+    """Bind a schema using DeepSeek-compatible function calling.
+
+    LangChain's ChatOpenAI integration defaults to the ``json_schema`` response
+    format, which DeepSeek's Chat Completions endpoint does not accept. Regular
+    function calling supports the same Pydantic schemas without requiring the
+    beta strict-tool endpoint.
+    """
+    return llm.with_structured_output(
+        schema,
+        method="function_calling",
+        strict=False,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
 
 
 class LLMFactory(Protocol):

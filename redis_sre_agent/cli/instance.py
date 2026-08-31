@@ -12,7 +12,11 @@ from ulid import ULID
 
 from redis_sre_agent.core import instances as core_instances
 from redis_sre_agent.core.instance_mutation_helpers import _validate_instance_cluster_link
-from redis_sre_agent.core.redis_topology import classify_redis_endpoint, probe_redis_topology
+from redis_sre_agent.core.redis_topology import (
+    RedisTopologyProbeResult,
+    classify_redis_endpoint,
+    probe_redis_topology,
+)
 
 
 def _payload(instance: core_instances.RedisInstance) -> dict:
@@ -20,6 +24,17 @@ def _payload(instance: core_instances.RedisInstance) -> dict:
     payload["connection_url"] = core_instances.mask_redis_url(instance.connection_url)
     payload.pop("extension_secrets", None)
     return payload
+
+
+def _probe_payload(result: RedisTopologyProbeResult) -> dict:
+    """Serialize a topology probe result at the CLI boundary."""
+    return {
+        "succeeded": result.succeeded,
+        "instance_type": result.instance_type.value if result.instance_type else None,
+        "evidence": list(result.evidence),
+        "error": result.error.value if result.error else None,
+        "error_summary": result.error_summary,
+    }
 
 
 def _emit(payload: object, *, as_json: bool) -> None:
@@ -191,7 +206,8 @@ def delete_instance(instance_id: str, yes: bool, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def test_url(connection_url: str, as_json: bool) -> None:
     """Probe a Redis URL without registering it."""
-    _emit(asyncio.run(probe_redis_topology(connection_url)).model_dump(mode="json"), as_json=as_json)
+    result = asyncio.run(probe_redis_topology(connection_url))
+    _emit(_probe_payload(result), as_json=as_json)
 
 
 @instance.command("test")
@@ -204,6 +220,7 @@ def test_instance(instance_id: str, as_json: bool) -> None:
         item = await core_instances.get_instance_by_id(instance_id)
         if item is None:
             raise click.ClickException("Instance not found")
-        _emit((await probe_redis_topology(item.connection_url.get_secret_value())).model_dump(mode="json"), as_json=as_json)
+        result = await probe_redis_topology(item.connection_url.get_secret_value())
+        _emit(_probe_payload(result), as_json=as_json)
 
     asyncio.run(run())

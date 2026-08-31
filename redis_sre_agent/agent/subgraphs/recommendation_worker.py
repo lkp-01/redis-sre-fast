@@ -17,6 +17,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from opentelemetry import trace
 
+from ...core.llm_helpers import bind_structured_output
 from ...core.llm_request_guard import GuardedMemoizeLLMProxy, guarded_ainvoke
 from ..helpers import ensure_tool_bound_llm, log_preflight_messages, sanitize_messages_for_llm
 from ..models import Recommendation
@@ -127,7 +128,7 @@ def build_recommendation_worker(
     async def synth_node(state: RecState) -> RecState:
         # Final structured synthesis without further tool calls.
         # Build a focused prompt that includes the topic and evidence envelopes.
-        structured_llm = base_llm.with_structured_output(Recommendation)
+        structured_llm = bind_structured_output(base_llm, Recommendation)
         memoized_synth_llm = (
             GuardedMemoizeLLMProxy(
                 structured_llm,

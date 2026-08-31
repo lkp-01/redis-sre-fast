@@ -76,7 +76,8 @@ def query(
         # Validate targeting mode: at most one explicit target
         if redis_instance_id and redis_cluster_id:
             console.print(
-                "[red]❌ Please provide only one of --redis-instance-id or --redis-cluster-id[/red]"
+                "[red]\\[error] Please provide only one of "
+                "--redis-instance-id or --redis-cluster-id[/red]"
             )
             exit(1)
 
@@ -85,7 +86,9 @@ def query(
         if redis_instance_id:
             instance = await get_instance_by_id(redis_instance_id)
             if not instance:
-                console.print(f"[red]❌ Instance not found: {redis_instance_id}[/red]")
+                console.print(
+                    f"[red]\\[error] Instance not found: {redis_instance_id}[/red]"
+                )
                 exit(1)
 
         # Resolve cluster if provided
@@ -93,7 +96,9 @@ def query(
         if redis_cluster_id:
             cluster = await get_cluster_by_id(redis_cluster_id)
             if not cluster:
-                console.print(f"[red]❌ Cluster not found: {redis_cluster_id}[/red]")
+                console.print(
+                    f"[red]\\[error] Cluster not found: {redis_cluster_id}[/red]"
+                )
                 exit(1)
 
         # Get or create thread
@@ -106,13 +111,13 @@ def query(
             # Continue existing thread
             thread = await thread_manager.get_thread(thread_id)
             if not thread:
-                console.print(f"[red]❌ Thread not found: {thread_id}[/red]")
+                console.print(f"[red]\\[error] Thread not found: {thread_id}[/red]")
                 exit(1)
 
             resolved_user_id = user_id or thread.metadata.user_id
             active_session_id = thread.metadata.session_id or thread_id
 
-            console.print(f"[dim]📎 Continuing thread: {thread_id}[/dim]")
+            console.print(f"[dim]\\[thread] Continuing thread: {thread_id}[/dim]")
 
             # Load conversation history
             for msg in thread.messages:
@@ -125,11 +130,15 @@ def query(
             if not instance and not cluster and thread.context.get("instance_id"):
                 instance = await get_instance_by_id(thread.context["instance_id"])
                 if instance:
-                    console.print(f"[dim]🔗 Using instance from thread: {instance.name}[/dim]")
+                    console.print(
+                        f"[dim]\\[target] Using instance from thread: {instance.name}[/dim]"
+                    )
             elif not instance and not cluster and thread.context.get("cluster_id"):
                 cluster = await get_cluster_by_id(thread.context["cluster_id"])
                 if cluster:
-                    console.print(f"[dim]🔗 Using cluster from thread: {cluster.name}[/dim]")
+                    console.print(
+                        f"[dim]\\[target] Using cluster from thread: {cluster.name}[/dim]"
+                    )
 
         else:
             # Create new thread
@@ -147,14 +156,14 @@ def query(
                 tags=["cli"],
             )
             await thread_manager.update_thread_subject(active_thread_id, query)
-            console.print(f"[dim]📎 Created thread: {active_thread_id}[/dim]")
+            console.print(f"[dim]\\[thread] Created thread: {active_thread_id}[/dim]")
 
-        console.print(f"[bold]🔍 Query:[/bold] {query}")
+        console.print(f"[bold]\\[query] Query:[/bold] {query}")
 
         if instance:
-            console.print(f"[dim]🔗 Redis instance: {instance.name}[/dim]")
+            console.print(f"[dim]\\[target] Redis instance: {instance.name}[/dim]")
         elif cluster:
-            console.print(f"[dim]🔗 Redis cluster: {cluster.name}[/dim]")
+            console.print(f"[dim]\\[target] Redis cluster: {cluster.name}[/dim]")
 
         # Build context for routing
         routing_context = {}
@@ -174,7 +183,7 @@ def query(
         if agent != "auto":
             agent_type = agent_choice_map[agent.lower()]
             agent_label = "Chat" if agent.lower() == "knowledge" else agent.capitalize()
-            console.print(f"[dim]🔧 Agent: {agent_label} (selected)[/dim]")
+            console.print(f"[dim]\\[agent] Agent: {agent_label} (selected)[/dim]")
         else:
             agent_type = await route_to_appropriate_agent(
                 query=query,
@@ -186,7 +195,7 @@ def query(
                 AgentType.REDIS_CHAT: "Chat",
                 AgentType.KNOWLEDGE_ONLY: "Chat",
             }.get(agent_type, agent_type.value)
-            console.print(f"[dim]🔧 Agent: {agent_label}[/dim]")
+            console.print(f"[dim]\\[agent] Agent: {agent_label}[/dim]")
 
         # Get the appropriate agent instance
         if agent_type == AgentType.REDIS_TRIAGE:
@@ -226,7 +235,9 @@ def query(
                     message_id=assistant_message_id,
                     tool_envelopes=agent_response.tool_envelopes,
                 )
-                console.print(f"[dim]📋 Decision trace: {assistant_message_id}[/dim]")
+                console.print(
+                    f"[dim]\\[trace] Decision trace: {assistant_message_id}[/dim]"
+                )
 
             # Build messages list with message_id in metadata
             messages_to_save = [
@@ -241,18 +252,18 @@ def query(
             # Save messages to thread
             await thread_manager.append_messages(active_thread_id, messages_to_save)
 
-            console.print("\n[bold green]✅ Response:[/bold green]\n")
+            console.print("\n[bold green]\\[ok] Response:[/bold green]\n")
             console.print(Markdown(response_text))
 
             # Show thread ID for follow-up queries
-            console.print("\n[dim]💡 To continue this conversation:[/dim]")
+            console.print("\n[dim]\\[hint] To continue this conversation:[/dim]")
             console.print(
                 f'[dim]   redis-sre-agent query --thread-id {active_thread_id} "your follow-up"[/dim]'
             )
 
         except Exception as e:
             log_cli_exception(__name__, "query CLI command failed", e)
-            console.print(f"[red]❌ Error: {e}[/red]")
+            console.print(f"[red]\\[error] Error: {e}[/red]")
             exit(1)
         finally:
             # Force-close MCP pool to avoid cross-task cleanup errors on exit

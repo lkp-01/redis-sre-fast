@@ -98,7 +98,9 @@ Be rigorous in your evaluation. Technical accuracy is paramount - any Redis misc
 
     def __init__(self):
         """Initialize the judge with LLM."""
-        self.llm = create_mini_llm(model="gpt-4o-mini")
+        # Use the configured mini-tier mapping so OpenAI-compatible providers such as
+        # DeepSeek do not receive a hard-coded OpenAI model identifier.
+        self.llm = create_mini_llm()
 
     @staticmethod
     def _serialize_for_prompt(value: Any) -> str:

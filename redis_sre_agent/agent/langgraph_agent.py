@@ -35,7 +35,7 @@ from ..core.instances import (
     get_instances,
     save_instances,
 )
-from ..core.llm_helpers import create_llm, create_mini_llm
+from ..core.llm_helpers import bind_structured_output, create_llm, create_mini_llm
 from ..core.llm_request_guard import guarded_ainvoke
 from ..core.progress import NullEmitter, ProgressEmitter
 from ..core.redis import get_redis_client
@@ -1257,9 +1257,7 @@ JSON payload of analyses artifacts:
             try:
                 from .models import TopicsList
 
-                extractor_llm = self.mini_llm.with_structured_output(
-                    TopicsList
-                )  # return TopicsList
+                extractor_llm = bind_structured_output(self.mini_llm, TopicsList)
                 instance_ctx = {
                     "instance_type": target_instance.instance_type if target_instance else "unscoped",
                     "name": target_instance.name if target_instance else "unscoped_analysis",

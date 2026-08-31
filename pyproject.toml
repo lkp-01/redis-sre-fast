@@ -69,6 +69,11 @@ dependencies = [
     "jmespath>=1.0.1",
 ]
 
+[project.optional-dependencies]
+eval-control = [
+    "testcontainers>=3.7.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",

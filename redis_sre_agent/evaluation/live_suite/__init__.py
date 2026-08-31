@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Sequence
 
@@ -139,9 +140,14 @@ class LiveEvalSuiteSummary(BaseModel):
     git_sha: str
     baseline_policy: EvalBaselinePolicy
     total_scenarios: int
+    passed_scenarios: int = 0
     failed_scenarios: int
+    pass_rate: float | None = Field(default=None, ge=0, le=1)
+    judge_score: float | None = None
     allowed_failed_scenarios: int
     all_passed: bool
+    started_at: str | None = None
+    completed_at: str | None = None
     output_dir: str
     results: list[LiveEvalScenarioResult] = Field(default_factory=list)
 
@@ -156,8 +162,12 @@ class LiveEvalComparisonRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scenario_id: str
+    baseline_pass: bool | None = None
+    candidate_pass: bool | None = None
     baseline_score: float | None = None
     candidate_score: float | None = None
+    score_delta: float | None = None
+    classification: str = "unchanged"
     passed: bool
     violations: list[str] = Field(default_factory=list)
 
@@ -170,6 +180,14 @@ class LiveEvalComparisonSummary(BaseModel):
     baseline_dir: str
     candidate_dir: str
     passed: bool
+    baseline_pass_rate: float | None = None
+    candidate_pass_rate: float | None = None
+    pass_rate_delta: float | None = None
+    baseline_judge_score: float | None = None
+    candidate_judge_score: float | None = None
+    judge_score_delta: float | None = None
+    regression_count: int = 0
+    improvement_count: int = 0
     rows: list[LiveEvalComparisonRow] = Field(default_factory=list)
 
 
@@ -656,6 +674,7 @@ async def run_live_eval_suite(
 ) -> LiveEvalSuiteSummary:
     """Run a live-model eval suite from either a manifest path or config entry."""
 
+    started_at = datetime.now(timezone.utc).isoformat()
     active_trigger = resolve_live_eval_trigger(event_name or trigger)
     normalized_event = _normalize_policy_event_name(active_trigger)
 
@@ -714,6 +733,18 @@ async def run_live_eval_suite(
             )
 
     failed_scenarios = sum(1 for result in results if not result.overall_pass)
+    passed_scenarios = len(results) - failed_scenarios
+    report_bundles = [
+        EvalReportBundle.model_validate_json(
+            Path(result.report_json).read_text(encoding="utf-8")
+        )
+        for result in results
+    ]
+    judge_scores = [
+        bundle.judge_scores.overall_score
+        for bundle in report_bundles
+        if bundle.judge_scores is not None
+    ]
     allowed_failed_scenarios = baseline_policy.max_failed_scenarios or 0
     summary = LiveEvalSuiteSummary(
         suite_name=suite.name,
@@ -722,9 +753,14 @@ async def run_live_eval_suite(
         git_sha=git_sha,
         baseline_policy=baseline_policy,
         total_scenarios=len(results),
+        passed_scenarios=passed_scenarios,
         failed_scenarios=failed_scenarios,
+        pass_rate=passed_scenarios / len(results) if results else None,
+        judge_score=sum(judge_scores) / len(judge_scores) if judge_scores else None,
         allowed_failed_scenarios=allowed_failed_scenarios,
         all_passed=failed_scenarios <= allowed_failed_scenarios,
+        started_at=started_at,
+        completed_at=datetime.now(timezone.utc).isoformat(),
         output_dir=str(target_output_dir),
         results=results,
     )
@@ -778,6 +814,13 @@ def compare_live_eval_reports(
             if candidate is not None and candidate.judge_scores
             else None
         )
+        baseline_pass = bool(baseline.overall_pass) if baseline is not None else None
+        candidate_pass = bool(candidate.overall_pass) if candidate is not None else None
+        score_delta = (
+            candidate_score - baseline_score
+            if baseline_score is not None and candidate_score is not None
+            else None
+        )
 
         if baseline is None:
             violations.append("missing baseline report")
@@ -796,20 +839,75 @@ def compare_live_eval_reports(
                     f"({baseline_score} -> {candidate_score}, allowed {allowed_drop})"
                 )
 
+        if baseline is None:
+            classification = "added"
+        elif candidate is None:
+            classification = "removed"
+        elif baseline_pass and not candidate_pass:
+            classification = "regression"
+        elif not baseline_pass and candidate_pass:
+            classification = "improvement"
+        elif score_delta is not None and score_delta < -allowed_drop:
+            classification = "regression"
+        elif score_delta is not None and score_delta > allowed_drop:
+            classification = "improvement"
+        else:
+            classification = "unchanged"
+
         rows.append(
             LiveEvalComparisonRow(
                 scenario_id=scenario_id,
+                baseline_pass=baseline_pass,
+                candidate_pass=candidate_pass,
                 baseline_score=baseline_score,
                 candidate_score=candidate_score,
+                score_delta=score_delta,
+                classification=classification,
                 passed=not violations,
                 violations=violations,
             )
         )
 
+    def _pass_rate(bundles: dict[str, EvalReportBundle]) -> float | None:
+        if not bundles:
+            return None
+        return sum(bool(bundle.overall_pass) for bundle in bundles.values()) / len(bundles)
+
+    def _mean_score(bundles: dict[str, EvalReportBundle]) -> float | None:
+        scores = [
+            bundle.judge_scores.overall_score
+            for bundle in bundles.values()
+            if bundle.judge_scores is not None
+        ]
+        return sum(scores) / len(scores) if scores else None
+
+    baseline_pass_rate = _pass_rate(baseline_bundles)
+    candidate_pass_rate = _pass_rate(candidate_bundles)
+    baseline_judge_score = _mean_score(baseline_bundles)
+    candidate_judge_score = _mean_score(candidate_bundles)
+
     return LiveEvalComparisonSummary(
         baseline_dir=str(Path(baseline_dir).expanduser().resolve()),
         candidate_dir=str(Path(candidate_dir).expanduser().resolve()),
-        passed=all(row.passed for row in rows),
+        passed=bool(rows) and all(row.passed for row in rows),
+        baseline_pass_rate=baseline_pass_rate,
+        candidate_pass_rate=candidate_pass_rate,
+        pass_rate_delta=(
+            candidate_pass_rate - baseline_pass_rate
+            if baseline_pass_rate is not None and candidate_pass_rate is not None
+            else None
+        ),
+        baseline_judge_score=baseline_judge_score,
+        candidate_judge_score=candidate_judge_score,
+        judge_score_delta=(
+            candidate_judge_score - baseline_judge_score
+            if baseline_judge_score is not None and candidate_judge_score is not None
+            else None
+        ),
+        regression_count=sum(
+            row.classification in {"regression", "removed"} for row in rows
+        ),
+        improvement_count=sum(row.classification == "improvement" for row in rows),
         rows=rows,
     )
 

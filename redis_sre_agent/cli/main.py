@@ -10,6 +10,7 @@ from redis_sre_agent.cli.logging_utils import (
     log_cli_exception,
     was_cli_exception_logged,
 )
+from redis_sre_agent.cli.output import configure_cli_output
 
 configure_cli_logging()
 
@@ -71,6 +72,7 @@ class LazyGroup(click.MultiCommand):
         return getattr(mod, attr)
 
     def invoke(self, ctx):
+        configure_cli_output()
         try:
             return super().invoke(ctx)
         except (click.exceptions.Exit, click.ClickException, click.Abort, SystemExit):

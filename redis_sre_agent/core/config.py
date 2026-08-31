@@ -271,6 +271,24 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False, description="Enable debug mode")
     log_level: str = Field(default="INFO", description="Logging level")
 
+    # Eval control plane (disabled by default because live evals consume LLM and Docker resources)
+    eval_control_enabled: bool = Field(
+        default=False,
+        description="Enable the authenticated live-eval control-plane API.",
+    )
+    eval_suite_root: Path = Field(
+        default=Path("evals/suites"),
+        description="Trusted directory scanned for eval suite manifests.",
+    )
+    eval_run_root: Path = Field(
+        default=Path(".artifacts/eval-control"),
+        description="Persistent local root for eval run manifests and reports.",
+    )
+    eval_repo_root: Path = Field(
+        default=Path("."),
+        description="Repository checkout used by isolated eval worker processes.",
+    )
+
     # Server
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8000, description="Server port")
