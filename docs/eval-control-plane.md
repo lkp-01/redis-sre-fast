@@ -33,6 +33,8 @@ of the configured API base URL.
 - `GET /api/v1/evals/suites`
 - `GET /api/v1/evals/suites/{suite_id}`
 - `POST /api/v1/evals/runs` with `{ "suite_id": "live-agent-only-smoke" }`
+- `POST /api/v1/evals/runs` with a trusted subset, for example
+  `{ "suite_id": "live-agent-only-smoke", "scenario_ids": ["prompt/knowledge-agent-no-live-access"] }`
 - `GET /api/v1/evals/runs`
 - `GET /api/v1/evals/runs/{run_id}`
 - `GET /api/v1/evals/runs/{run_id}/reports`
@@ -40,7 +42,12 @@ of the configured API base URL.
 - `POST /api/v1/evals/comparisons`
 
 The run request intentionally accepts no file path, output path, branch, or API credential. A
-suite must be present in the discovered Registry. Only one live eval may run at a time.
+suite must be present in the discovered Registry. When `scenario_ids` is omitted, all scenarios
+in the suite run. When it is provided, it must be non-empty, contain no duplicates, and every ID
+must belong to that suite. The persisted run keeps the selected IDs in suite-manifest order and
+sets `is_partial=true` when the selection does not cover the full suite. Only one live eval may
+run at a time. Comparisons require the same suite and identical scenario selections, so a partial
+run cannot accidentally be compared with a full-suite baseline.
 
 Execution status and evaluation quality are separate: a run can be `completed` while
 `evaluation_passed` is `false`. `failed` means the worker infrastructure did not complete the

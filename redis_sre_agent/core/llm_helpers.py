@@ -32,6 +32,7 @@ Programmatic registration:
 import importlib
 import logging
 from typing import Any, Optional, Protocol
+from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -42,6 +43,47 @@ from redis_sre_agent.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _uses_deepseek_api(llm: Any) -> bool:
+    """Return whether an LLM targets DeepSeek's official OpenAI-compatible API."""
+    candidate = getattr(llm, "openai_api_base", None)
+    if candidate is None:
+        bound_llm = getattr(llm, "bound", None)
+        candidate = getattr(bound_llm, "openai_api_base", None)
+    candidate = candidate or settings.openai_base_url
+    if not candidate:
+        return False
+
+    try:
+        hostname = (urlparse(str(candidate)).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname == "deepseek.com" or hostname.endswith(".deepseek.com")
+
+
+def _with_deepseek_non_thinking_mode(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return binding kwargs that explicitly disable DeepSeek thinking mode."""
+    compatible_kwargs = dict(kwargs)
+    extra_body = dict(compatible_kwargs.get("extra_body") or {})
+    extra_body["thinking"] = {"type": "disabled"}
+    compatible_kwargs["extra_body"] = extra_body
+    return compatible_kwargs
+
+
+def bind_tools_for_provider(llm: BaseChatModel, tools: Any, **kwargs: Any) -> Any:
+    """Bind tools using request options compatible with the configured provider.
+
+    DeepSeek V4 enables thinking mode by default. Its Chat Completions API rejects
+    explicit ``tool_choice`` values in that mode, and thinking-mode tool loops also
+    require provider-specific reasoning content to be replayed. Keep tool-bound
+    LangChain conversations in non-thinking mode so both forced and multi-turn tool
+    calls remain compatible.
+    """
+    bind_kwargs = dict(kwargs)
+    if _uses_deepseek_api(llm):
+        bind_kwargs = _with_deepseek_non_thinking_mode(bind_kwargs)
+    return llm.bind_tools(tools, **bind_kwargs)
+
+
 def bind_structured_output(llm: BaseChatModel, schema: Any) -> Any:
     """Bind a schema using DeepSeek-compatible function calling.
 
@@ -50,12 +92,13 @@ def bind_structured_output(llm: BaseChatModel, schema: Any) -> Any:
     function calling supports the same Pydantic schemas without requiring the
     beta strict-tool endpoint.
     """
-    return llm.with_structured_output(
-        schema,
-        method="function_calling",
-        strict=False,
-        extra_body={"thinking": {"type": "disabled"}},
-    )
+    bind_kwargs: dict[str, Any] = {
+        "method": "function_calling",
+        "strict": False,
+    }
+    if _uses_deepseek_api(llm):
+        bind_kwargs = _with_deepseek_non_thinking_mode(bind_kwargs)
+    return llm.with_structured_output(schema, **bind_kwargs)
 
 
 class LLMFactory(Protocol):

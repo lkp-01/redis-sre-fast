@@ -24,6 +24,7 @@ from .models import (
     EffectiveEvalConfig,
     EvalRunRecord,
     EvalRunStatus,
+    SuiteDescriptor,
     utc_now_iso,
 )
 from .registry import SuiteRegistry
@@ -38,6 +39,60 @@ class ActiveEvalRunError(RuntimeError):
     def __init__(self, run_id: str | None) -> None:
         self.run_id = run_id
         super().__init__(f"an eval run is already active: {run_id or 'unknown'}")
+
+
+class InvalidScenarioSelectionError(ValueError):
+    def __init__(
+        self,
+        *,
+        suite_id: str,
+        unknown_ids: list[str] | None = None,
+        duplicate_ids: list[str] | None = None,
+        empty: bool = False,
+    ) -> None:
+        self.suite_id = suite_id
+        self.unknown_ids = unknown_ids or []
+        self.duplicate_ids = duplicate_ids or []
+        if empty:
+            message = "scenario_ids must contain at least one scenario"
+        elif self.unknown_ids:
+            message = f"unknown scenario ids for suite '{suite_id}': {', '.join(self.unknown_ids)}"
+        else:
+            message = f"duplicate scenario ids: {', '.join(self.duplicate_ids)}"
+        super().__init__(message)
+
+
+def _select_scenario_ids(
+    suite: SuiteDescriptor,
+    scenario_ids: list[str] | None,
+) -> list[str]:
+    available_ids = [scenario.id for scenario in suite.scenarios]
+    if scenario_ids is None:
+        return available_ids
+    if not scenario_ids:
+        raise InvalidScenarioSelectionError(suite_id=suite.id, empty=True)
+
+    seen: set[str] = set()
+    duplicate_ids: list[str] = []
+    for scenario_id in scenario_ids:
+        if scenario_id in seen and scenario_id not in duplicate_ids:
+            duplicate_ids.append(scenario_id)
+        seen.add(scenario_id)
+    if duplicate_ids:
+        raise InvalidScenarioSelectionError(
+            suite_id=suite.id,
+            duplicate_ids=duplicate_ids,
+        )
+
+    available_set = set(available_ids)
+    unknown_ids = [scenario_id for scenario_id in scenario_ids if scenario_id not in available_set]
+    if unknown_ids:
+        raise InvalidScenarioSelectionError(
+            suite_id=suite.id,
+            unknown_ids=unknown_ids,
+        )
+    requested_set = set(scenario_ids)
+    return [scenario_id for scenario_id in available_ids if scenario_id in requested_set]
 
 
 def sanitize_run_error(error: object) -> str:
@@ -165,8 +220,15 @@ class EvalRunManager:
         if payload and payload.get("run_id") == run_id:
             self.lock_path.unlink(missing_ok=True)
 
-    async def create_run(self, suite_id: str, *, requested_by: str = "local") -> EvalRunRecord:
+    async def create_run(
+        self,
+        suite_id: str,
+        *,
+        requested_by: str = "local",
+        scenario_ids: list[str] | None = None,
+    ) -> EvalRunRecord:
         suite = self.registry.get(suite_id)
+        selected_scenario_ids = _select_scenario_ids(suite, scenario_ids)
         run_id = str(ULID())
         self._acquire_lock(run_id)
         try:
@@ -177,7 +239,8 @@ class EvalRunManager:
                 suite_name=suite.name,
                 suite_manifest=suite.manifest,
                 suite_digest=suite.digest,
-                scenario_ids=[scenario.id for scenario in suite.scenarios],
+                scenario_ids=selected_scenario_ids,
+                is_partial=len(selected_scenario_ids) < len(suite.scenarios),
                 requested_by=requested_by,
                 git_sha=git_sha,
                 git_dirty=git_dirty,
@@ -297,6 +360,7 @@ class EvalRunManager:
 __all__ = [
     "ActiveEvalRunError",
     "EvalRunManager",
+    "InvalidScenarioSelectionError",
     "capture_effective_config",
     "capture_git_state",
     "describe_run_error",

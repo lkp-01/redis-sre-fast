@@ -872,7 +872,7 @@ class ToolManager:
                 f"Available tools ({len(available_tools)}): {available_tools[:10]}..."
             )
 
-        normalized_args = dict(args or {})
+        normalized_args = self._normalize_tool_args(tool_name, args)
         metadata = tool.metadata
         action_kind = metadata.action_kind if metadata is not None else ToolActionKind.UNKNOWN
         if action_kind is ToolActionKind.READ:
@@ -1034,7 +1034,7 @@ class ToolManager:
     ) -> Any:
         """Route tool call to appropriate provider with approval-aware caching."""
 
-        normalized_args = dict(args or {})
+        normalized_args = self._normalize_tool_args(tool_name, args)
         decision = decision or await self.evaluate_tool_call(tool_name, normalized_args)
         if decision.mode is ToolExecutionMode.BLOCK:
             return dict(
@@ -1175,6 +1175,33 @@ class ToolManager:
             )
 
         return result
+
+    def _normalize_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop model-generated arguments not declared by the tool schema.
+
+        Tool definitions are the execution contract. Some non-strict providers
+        may still emit extra keys; forwarding those keys to provider methods
+        raises ``TypeError`` and wastes an agent tool-call iteration.
+        """
+        normalized_args = dict(args or {})
+        tool = self._tool_by_name.get(tool_name)
+        if tool is None:
+            return normalized_args
+
+        parameters = tool.definition.parameters or {}
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict) or parameters.get("additionalProperties") is True:
+            return normalized_args
+
+        allowed_keys = set(properties)
+        unknown_keys = sorted(set(normalized_args) - allowed_keys)
+        if unknown_keys:
+            logger.warning(
+                "Ignoring undeclared arguments for tool %s: %s",
+                tool_name,
+                ", ".join(unknown_keys),
+            )
+        return {key: value for key, value in normalized_args.items() if key in allowed_keys}
 
     async def execute_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Any]:
         """Execute a batch of tool calls returned by an LLM."""

@@ -23,7 +23,11 @@ from redis_sre_agent.core.agent_memory import prepare_agent_turn_memory
 from redis_sre_agent.core.clusters import RedisCluster
 from redis_sre_agent.core.config import settings
 from redis_sre_agent.core.instances import RedisInstance
-from redis_sre_agent.core.llm_helpers import create_llm, create_mini_llm
+from redis_sre_agent.core.llm_helpers import (
+    bind_tools_for_provider,
+    create_llm,
+    create_mini_llm,
+)
 from redis_sre_agent.core.llm_request_guard import guarded_ainvoke
 from redis_sre_agent.core.progress import (
     NullEmitter,
@@ -822,7 +826,7 @@ class ChatAgent:
                 "generation": generation,
                 "tooldefs_by_name": {t.name: t for t in tooldefs},
                 "all_adapters": all_adapters,
-                "llm_with_expand": self.llm.bind_tools(all_adapters),
+                "llm_with_expand": bind_tools_for_provider(self.llm, all_adapters),
                 "local_tools": {expand_spec["name"]: expand_spec["func"]},
             }
             runtime_tools_by_generation[generation] = runtime

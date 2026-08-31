@@ -521,6 +521,30 @@ def _coerce_live_scenario(scenario: EvalScenario) -> EvalScenario:
     return scenario.model_copy(update={"execution": execution})
 
 
+def _select_live_eval_scenarios(
+    scenarios: Sequence[EvalScenario],
+    scenario_ids: Iterable[str] | None,
+) -> list[EvalScenario]:
+    available_ids = [scenario.id for scenario in scenarios]
+    if len(set(available_ids)) != len(available_ids):
+        raise ValueError("live eval suite contains duplicate scenario ids")
+    if scenario_ids is None:
+        return list(scenarios)
+
+    requested_ids = list(scenario_ids)
+    if not requested_ids:
+        raise ValueError("scenario_ids must contain at least one scenario")
+    if len(set(requested_ids)) != len(requested_ids):
+        raise ValueError("scenario_ids contains duplicate scenario ids")
+
+    available_set = set(available_ids)
+    unknown_ids = [scenario_id for scenario_id in requested_ids if scenario_id not in available_set]
+    if unknown_ids:
+        raise ValueError(f"unknown scenario ids: {', '.join(unknown_ids)}")
+    requested_set = set(requested_ids)
+    return [scenario for scenario in scenarios if scenario.id in requested_set]
+
+
 def _mechanical_assertion_scenario(scenario: EvalScenario) -> EvalScenario:
     """Drop free-form text assertions for live suites.
 
@@ -671,6 +695,7 @@ async def run_live_eval_suite(
     judge: SREAgentJudge | None = None,
     judge_criteria: Iterable[EvaluationCriteria] | None = None,
     judge_pass_threshold: float | None = None,
+    scenario_ids: Iterable[str] | None = None,
 ) -> LiveEvalSuiteSummary:
     """Run a live-model eval suite from either a manifest path or config entry."""
 
@@ -702,6 +727,16 @@ async def run_live_eval_suite(
     )
     validated_trigger = validate_live_eval_trigger(baseline_policy, trigger=active_trigger)
 
+    loaded_scenarios: list[EvalScenario] = []
+    for scenario_ref in suite.scenarios:
+        scenario_path = (
+            Path(scenario_ref)
+            if config_path is None
+            else _resolve_relative_path(resolved_config_path, scenario_ref)
+        )
+        loaded_scenarios.append(_coerce_live_scenario(load_eval_scenario(scenario_path)))
+    selected_scenarios = _select_live_eval_scenarios(loaded_scenarios, scenario_ids)
+
     target_output_dir = Path(output_dir or report_dir or ".artifacts/evals").expanduser().resolve()
     target_output_dir = target_output_dir / (suite.output_subdir or suite.name)
     target_output_dir.mkdir(parents=True, exist_ok=True)
@@ -709,13 +744,7 @@ async def run_live_eval_suite(
     git_sha = _current_git_sha()
     results: list[LiveEvalScenarioResult] = []
     async with _live_eval_redis_client() as redis_client:
-        for scenario_ref in suite.scenarios:
-            scenario_path = (
-                Path(scenario_ref)
-                if config_path is None
-                else _resolve_relative_path(resolved_config_path, scenario_ref)
-            )
-            scenario = _coerce_live_scenario(load_eval_scenario(scenario_path))
+        for scenario in selected_scenarios:
             results.append(
                 await _run_scenario_live(
                     scenario,

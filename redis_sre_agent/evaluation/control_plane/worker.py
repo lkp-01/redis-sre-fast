@@ -61,6 +61,7 @@ async def execute_run(
             update_baseline=False,
             session_id_prefix=f"eval-run-{run_id}",
             user_id=f"eval-control-plane::{record.requested_by}",
+            scenario_ids=record.scenario_ids or None,
         )
         record.status = EvalRunStatus.COMPLETED
         record.completed_at = summary.completed_at or utc_now_iso()

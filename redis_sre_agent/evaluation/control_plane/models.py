@@ -91,6 +91,7 @@ class EvalRunRecord(BaseModel):
     suite_manifest: str
     suite_digest: str
     scenario_ids: list[str] = Field(default_factory=list)
+    is_partial: bool = False
     status: EvalRunStatus = EvalRunStatus.QUEUED
     created_at: str = Field(default_factory=utc_now_iso)
     started_at: str | None = None

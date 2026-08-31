@@ -12,6 +12,8 @@ import jmespath
 from jmespath.exceptions import JMESPathError
 from langchain_core.messages import AIMessage
 
+from redis_sre_agent.core.llm_helpers import bind_tools_for_provider
+
 KNOWLEDGE_SEARCH_RETRIEVAL_KIND = "knowledge_search"
 KNOWLEDGE_SEARCH_RETRIEVAL_LABEL = "Knowledge search"
 STARTUP_CONTEXT_CITATION_GROUP = "startup_context_loaded"
@@ -76,7 +78,7 @@ def ensure_tool_bound_llm(base_llm: Any, tool_adapters: List[Any]) -> Any:
     if isinstance(bound_kwargs, dict) and bound_kwargs.get("tools"):
         return base_llm
     if tool_adapters and hasattr(base_llm, "bind_tools"):
-        return base_llm.bind_tools(tool_adapters)
+        return bind_tools_for_provider(base_llm, tool_adapters)
     return base_llm
 
 
@@ -321,6 +323,9 @@ async def build_adapters_for_tooldefs(tool_manager: Any, tooldefs: List[Any]) ->
         # Best-effort fallback (should not happen in runtime)
         return []
 
+    class _StrictToolArgsModel(_BaseModel):
+        model_config = _ConfigDict(extra="forbid")
+
     def _field_default(spec: dict, is_required: bool):
         if is_required:
             return ...
@@ -368,13 +373,10 @@ async def build_adapters_for_tooldefs(tool_manager: Any, tooldefs: List[Any]) ->
                 _python_type_for(spec, k in required),
                 _Field(default, description=spec.get("description")),
             )
-        args_model = _create_model(f"{tool_name}_Args", __base__=_BaseModel, **fields)
-        # allow extra to be resilient to provider-side schema drift
-        try:
-            args_model.model_config = _ConfigDict(extra="allow")  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        return args_model
+        # Provider methods are called with keyword arguments derived from this
+        # schema. Advertising arbitrary extras lets models emit arguments that
+        # the implementation cannot accept, so keep the LLM contract strict.
+        return _create_model(f"{tool_name}_Args", __base__=_StrictToolArgsModel, **fields)
 
     adapters: list[_StructuredTool] = []
     for tdef in tooldefs or []:

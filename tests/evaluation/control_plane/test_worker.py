@@ -52,7 +52,10 @@ async def test_worker_persists_completed_quality_result(tmp_path: Path) -> None:
     store = FileEvalRunStore(tmp_path / "control")
     record = _queued_run(registry, store)
 
+    runner_calls = []
+
     async def fake_runner(*args, **kwargs):
+        runner_calls.append(kwargs)
         output_dir = Path(kwargs["output_dir"]) / "example"
         output_dir.mkdir(parents=True)
         (output_dir / "summary.json").write_text("{}", encoding="utf-8")
@@ -84,6 +87,7 @@ async def test_worker_persists_completed_quality_result(tmp_path: Path) -> None:
     assert result.evaluation_passed is False
     assert result.pass_rate == 0
     assert result.judge_score == 61
+    assert runner_calls[0]["scenario_ids"] == ["prompt/example"]
     assert not (store.root / "active.lock").exists()
 
 
@@ -107,4 +111,3 @@ async def test_worker_sanitizes_failure_without_storing_api_key(tmp_path: Path) 
     assert "deepseek-secret-value" not in (result.error or "")
     persisted = json.loads((store.run_dir(record.run_id) / "run.json").read_text())
     assert "deepseek-secret-value" not in json.dumps(persisted)
-

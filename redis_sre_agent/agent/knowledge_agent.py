@@ -19,7 +19,7 @@ from opentelemetry import trace
 
 from redis_sre_agent.core.agent_memory import prepare_agent_turn_memory
 from redis_sre_agent.core.config import settings
-from redis_sre_agent.core.llm_helpers import create_llm
+from redis_sre_agent.core.llm_helpers import bind_tools_for_provider, create_llm
 from redis_sre_agent.core.llm_request_guard import guarded_ainvoke
 from redis_sre_agent.core.llm_token_usage import LLMTokenLimitExceededError
 from redis_sre_agent.core.progress import (
@@ -44,6 +44,12 @@ from .terminal_synthesis import (
 
 logger = logging.getLogger(__name__)
 tracer = trace.get_tracer(__name__)
+
+KNOWLEDGE_LLM_REQUEST_FAILED_MESSAGE = (
+    "I couldn't complete this knowledge query because the language-model request failed. "
+    "Please try again later. If the problem persists, ask the service operator to check "
+    "the configured model provider and tool-calling compatibility."
+)
 
 
 # Knowledge-focused system prompt
@@ -293,11 +299,9 @@ class KnowledgeOnlyAgent:
                 state["signals_envelopes"] = signals_envelopes
                 return state
 
-            except Exception as e:
-                logger.error(f"Knowledge agent error: {e}")
-                error_message = AIMessage(
-                    content=f"I encountered an error while processing your request: {str(e)}. Please try rephrasing your question or ask for general SRE guidance."
-                )
+            except Exception:
+                logger.exception("Knowledge agent LLM request failed")
+                error_message = AIMessage(content=KNOWLEDGE_LLM_REQUEST_FAILED_MESSAGE)
                 state["messages"] = list(state["messages"]) + [error_message]
                 state["current_tool_calls"] = []
                 state["startup_system_prompt"] = startup_system_prompt
@@ -558,7 +562,7 @@ class KnowledgeOnlyAgent:
             from .helpers import build_adapters_for_tooldefs as _build_adapters
 
             adapters = await _build_adapters(tool_mgr, tools)
-            llm_with_tools = self.llm.bind_tools(adapters)
+            llm_with_tools = bind_tools_for_provider(self.llm, adapters)
 
             # Build workflow with tools and bound LLM
             workflow = self._build_workflow(tool_mgr, llm_with_tools, emitter)
@@ -662,13 +666,16 @@ class KnowledgeOnlyAgent:
 
             except LLMTokenLimitExceededError:
                 raise
-            except Exception as e:
-                logger.error(f"Knowledge agent processing failed: {e}")
-                error_response = f"I encountered an error while processing your knowledge query: {str(e)}. Please try asking a more specific question about SRE practices, troubleshooting methodologies, or system reliability concepts."
+            except Exception:
+                logger.exception("Knowledge agent processing failed")
 
-                await emitter.emit(f"Knowledge agent encountered an error: {str(e)}", "agent_error")
+                await emitter.emit("Knowledge agent encountered a model request error.", "agent_error")
 
-                return AgentResponse(response=error_response, search_results=[], tool_envelopes=[])
+                return AgentResponse(
+                    response=KNOWLEDGE_LLM_REQUEST_FAILED_MESSAGE,
+                    search_results=[],
+                    tool_envelopes=[],
+                )
 
     @classmethod
     def _extract_final_response(cls, messages: List[BaseMessage]) -> str:

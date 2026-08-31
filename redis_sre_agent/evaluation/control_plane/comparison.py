@@ -36,6 +36,10 @@ class EvalComparisonService:
             raise InvalidEvalComparisonError("candidate run is not completed")
         if baseline.suite_id != candidate.suite_id:
             raise InvalidEvalComparisonError("baseline and candidate must use the same suite")
+        if baseline.scenario_ids != candidate.scenario_ids:
+            raise InvalidEvalComparisonError(
+                "baseline and candidate must use the same scenarios in the same order"
+            )
 
         summary = compare_live_eval_reports(
             self._report_root(baseline.run_id, baseline.report_root),
@@ -52,4 +56,3 @@ class EvalComparisonService:
 
 
 __all__ = ["EvalComparisonService", "InvalidEvalComparisonError"]
-

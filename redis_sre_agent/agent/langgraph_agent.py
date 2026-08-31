@@ -35,7 +35,12 @@ from ..core.instances import (
     get_instances,
     save_instances,
 )
-from ..core.llm_helpers import bind_structured_output, create_llm, create_mini_llm
+from ..core.llm_helpers import (
+    bind_structured_output,
+    bind_tools_for_provider,
+    create_llm,
+    create_mini_llm,
+)
 from ..core.llm_request_guard import guarded_ainvoke
 from ..core.progress import NullEmitter, ProgressEmitter
 from ..core.redis import get_redis_client
@@ -1339,7 +1344,7 @@ JSON payload of analyses artifacts:
                 all_adapters = list(knowledge_adapters) + [expand_tool]
 
                 if all_adapters:
-                    knowledge_llm = self.mini_llm.bind_tools(all_adapters)
+                    knowledge_llm = bind_tools_for_provider(self.mini_llm, all_adapters)
 
                 if all_adapters:
                     logger.info(
@@ -2052,7 +2057,7 @@ Alternatively, if you're looking for general Redis knowledge or best practices (
             adapters = await _build_adapters(tool_mgr, llm_tools)
 
             # Rebind LLM with tools for this query
-            self.llm_with_tools = self.llm.bind_tools(adapters)
+            self.llm_with_tools = bind_tools_for_provider(self.llm, adapters)
 
             # Rebuild workflow with the tool manager and target instance
             self.workflow = self._build_workflow(tool_mgr, target_instance)
@@ -2309,7 +2314,7 @@ Alternatively, if you're looking for general Redis knowledge or best practices (
                 adapters = await _build_adapters(corrector_tool_manager, tooldefs)
 
                 # LLM with tools bound via adapters
-                corrector_llm = self.mini_llm.bind_tools(adapters)
+                corrector_llm = bind_tools_for_provider(self.mini_llm, adapters)
 
                 # Build the compiled subgraph
                 corrector = build_safety_fact_corrector(
@@ -2481,7 +2486,7 @@ Alternatively, if you're looking for general Redis knowledge or best practices (
             ) as tool_mgr:
                 llm_tools = tool_mgr.get_tools_for_llm()
                 adapters = await _build_adapters(tool_mgr, llm_tools)
-                self.llm_with_tools = self.llm.bind_tools(adapters)
+                self.llm_with_tools = bind_tools_for_provider(self.llm, adapters)
                 self.workflow = self._build_workflow(tool_mgr, target_instance)
 
                 task_id = normalized_context.get("task_id")

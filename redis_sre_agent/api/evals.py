@@ -16,6 +16,7 @@ from redis_sre_agent.evaluation.control_plane.comparison import (
 from redis_sre_agent.evaluation.control_plane.manager import (
     ActiveEvalRunError,
     EvalRunManager,
+    InvalidScenarioSelectionError,
 )
 from redis_sre_agent.evaluation.control_plane.models import (
     EvalRunComparison,
@@ -44,6 +45,7 @@ class CreateEvalRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     suite_id: str = Field(min_length=1)
+    scenario_ids: list[str] | None = Field(default=None, min_length=1)
 
 
 class CompareEvalRunsRequest(BaseModel):
@@ -127,9 +129,22 @@ async def create_eval_run(payload: CreateEvalRunRequest, request: Request) -> Ev
     claims = getattr(request.state, "auth_claims", {}) or {}
     requested_by = str(claims.get("sub") or "local")
     try:
-        return await services.manager.create_run(payload.suite_id, requested_by=requested_by)
+        return await services.manager.create_run(
+            payload.suite_id,
+            requested_by=requested_by,
+            scenario_ids=payload.scenario_ids,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="eval suite not found") from exc
+    except InvalidScenarioSelectionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "unknown_scenario_ids": exc.unknown_ids,
+                "duplicate_scenario_ids": exc.duplicate_ids,
+            },
+        ) from exc
     except ActiveEvalRunError as exc:
         raise HTTPException(
             status_code=409,

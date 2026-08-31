@@ -13,14 +13,21 @@ from redis_sre_agent.evaluation.control_plane.store import FileEvalRunStore
 from redis_sre_agent.evaluation.report_schema import EvalReportBundle
 
 
-def _completed(store: FileEvalRunStore, run_id: str, suite_id: str, score: float) -> EvalRunRecord:
+def _completed(
+    store: FileEvalRunStore,
+    run_id: str,
+    suite_id: str,
+    score: float,
+    *,
+    scenario_ids: list[str] | None = None,
+) -> EvalRunRecord:
     record = EvalRunRecord(
         run_id=run_id,
         suite_id=suite_id,
         suite_name=suite_id,
         suite_manifest=f"{suite_id}.yaml",
         suite_digest="digest",
-        scenario_ids=["scenario"],
+        scenario_ids=scenario_ids or ["scenario"],
         git_sha="abc",
         status=EvalRunStatus.COMPLETED,
     )
@@ -62,3 +69,23 @@ def test_comparison_service_rejects_different_suites(tmp_path: Path) -> None:
     with pytest.raises(InvalidEvalComparisonError, match="same suite"):
         EvalComparisonService(store).compare(baseline.run_id, candidate.run_id)
 
+
+def test_comparison_service_rejects_different_scenario_selections(tmp_path: Path) -> None:
+    store = FileEvalRunStore(tmp_path)
+    baseline = _completed(
+        store,
+        "01J00000000000000000000001",
+        "suite",
+        70,
+        scenario_ids=["scenario"],
+    )
+    candidate = _completed(
+        store,
+        "01J00000000000000000000002",
+        "suite",
+        80,
+        scenario_ids=["other-scenario"],
+    )
+
+    with pytest.raises(InvalidEvalComparisonError, match="same scenarios"):
+        EvalComparisonService(store).compare(baseline.run_id, candidate.run_id)

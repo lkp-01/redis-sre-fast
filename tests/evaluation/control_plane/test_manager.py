@@ -9,11 +9,37 @@ from redis_sre_agent.evaluation.control_plane import manager as manager_module
 from redis_sre_agent.evaluation.control_plane.manager import (
     ActiveEvalRunError,
     EvalRunManager,
+    InvalidScenarioSelectionError,
 )
 from redis_sre_agent.evaluation.control_plane.models import EvalRunRecord, EvalRunStatus
 from redis_sre_agent.evaluation.control_plane.store import FileEvalRunStore
 
 from .test_worker import _registry
+
+
+def _two_scenario_registry(tmp_path: Path):
+    registry = _registry(tmp_path)
+    suite = registry.get("example")
+    second = suite.scenarios[0].model_copy(
+        update={"id": "prompt/second", "name": "Second scenario"}
+    )
+    third = suite.scenarios[0].model_copy(
+        update={"id": "prompt/third", "name": "Third scenario"}
+    )
+    expanded = suite.model_copy(
+        update={
+            "scenario_count": 3,
+            "scenarios": [suite.scenarios[0], second, third],
+        }
+    )
+
+    class StaticRegistry:
+        def get(self, suite_id: str):
+            if suite_id != expanded.id:
+                raise KeyError(suite_id)
+            return expanded
+
+    return StaticRegistry()
 
 
 @pytest.mark.asyncio
@@ -40,9 +66,53 @@ async def test_manager_allows_only_one_active_run(tmp_path: Path) -> None:
     assert first.requested_by == "operator"
     assert "main" in first.effective_config.agent_models
     assert first.status is EvalRunStatus.QUEUED
+    assert first.is_partial is False
     blocker.set()
     await manager.shutdown()
     manager.release_lock(first.run_id)
+
+
+@pytest.mark.asyncio
+async def test_manager_persists_an_ordered_partial_scenario_selection(tmp_path: Path) -> None:
+    registry = _two_scenario_registry(tmp_path)
+    store = FileEvalRunStore(tmp_path / "control")
+
+    async def no_op_launcher(run_id: str) -> None:
+        return None
+
+    manager = EvalRunManager(
+        registry,  # type: ignore[arg-type]
+        store,
+        repo_root=Path.cwd(),
+        process_launcher=no_op_launcher,
+    )
+
+    record = await manager.create_run(
+        "example",
+        scenario_ids=["prompt/second", "prompt/example"],
+    )
+    await asyncio.sleep(0)
+
+    assert record.scenario_ids == ["prompt/example", "prompt/second"]
+    assert record.is_partial is True
+    manager.release_lock(record.run_id)
+
+
+@pytest.mark.asyncio
+async def test_manager_rejects_unknown_or_duplicate_scenario_ids(tmp_path: Path) -> None:
+    registry = _two_scenario_registry(tmp_path)
+    store = FileEvalRunStore(tmp_path / "control")
+    manager = EvalRunManager(registry, store, repo_root=Path.cwd())  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidScenarioSelectionError, match="unknown"):
+        await manager.create_run("example", scenario_ids=["prompt/missing"])
+    with pytest.raises(InvalidScenarioSelectionError, match="duplicate"):
+        await manager.create_run(
+            "example",
+            scenario_ids=["prompt/example", "prompt/example"],
+        )
+
+    assert not manager.lock_path.exists()
 
 
 @pytest.mark.asyncio
