@@ -14,6 +14,9 @@ from redis_sre_agent.core.helper_utils import get_docket_redis_url as get_redis_
 from redis_sre_agent.core.redis import get_redis_client
 from redis_sre_agent.core.tasks import create_task
 from redis_sre_agent.pipelines.ingestion.processor import IngestionPipeline
+from redis_sre_agent.pipelines.ingestion.processor_source_helpers import (
+    find_supported_source_files,
+)
 from redis_sre_agent.pipelines.orchestrator import PipelineOrchestrator
 from redis_sre_agent.pipelines.scraper.base import ArtifactStorage
 
@@ -42,12 +45,9 @@ def _resolve_batch_date(storage: ArtifactStorage, batch_date: Optional[str]) -> 
     return batch_date
 
 
-def _list_source_markdown_files(source_path: Path) -> List[Path]:
-    """Return source markdown files excluding README files."""
-    markdown_files = [
-        path for path in source_path.rglob("*.md") if path.name.lower() != "readme.md"
-    ]
-    return sorted(markdown_files)
+def _list_source_files(source_path: Path) -> List[Path]:
+    """Return supported local knowledge-source files."""
+    return find_supported_source_files(source_path)
 
 
 def _build_pipeline_task_message(operation: str, kwargs: Dict[str, Any]) -> str:
@@ -168,9 +168,9 @@ async def run_pipeline_operation_helper(
         if not source_path.exists():
             raise ValueError(f"Source directory does not exist: {source_path}")
 
-        markdown_files = _list_source_markdown_files(source_path)
-        if not markdown_files:
-            raise ValueError(f"No markdown files found in {source_path}")
+        source_files = _list_source_files(source_path)
+        if not source_files:
+            raise ValueError(f"No supported source files found in {source_path}")
 
         storage = ArtifactStorage(artifacts_path)
         batch_date_to_use = _resolve_batch_date(storage, batch_date)
@@ -182,7 +182,7 @@ async def run_pipeline_operation_helper(
             "batch_date": batch_date_to_use,
             "prepared_count": prepared_count,
             "prepare_only": prepare_only,
-            "source_documents": [str(path.relative_to(source_path)) for path in markdown_files],
+            "source_documents": [str(path.relative_to(source_path)) for path in source_files],
         }
 
         if prepare_only:
@@ -252,9 +252,9 @@ async def queue_pipeline_operation_task(
     return {
         "thread_id": result["thread_id"],
         "task_id": result["task_id"],
-        "status": result["status"].value
-        if hasattr(result["status"], "value")
-        else str(result["status"]),
+        "status": (
+            result["status"].value if hasattr(result["status"], "value") else str(result["status"])
+        ),
         "message": f"Pipeline {operation} task queued for processing",
         "operation": operation,
     }

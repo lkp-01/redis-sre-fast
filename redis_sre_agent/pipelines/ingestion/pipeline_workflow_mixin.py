@@ -15,7 +15,9 @@ from redis_sre_agent.skills.discovery import (
 from .processor_indexing_helpers import index_processed_document
 from .processor_source_helpers import (
     create_scraped_document_from_markdown,
+    create_scraped_documents_from_openapi,
     find_markdown_files,
+    find_openapi_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,13 @@ class PipelineWorkflowMixin:
                 documents.append(create_scraped_document_from_markdown(md_file, source_dir))
             except Exception as exc:
                 logger.error("Failed to load source markdown %s: %s", md_file, exc)
+
+        openapi_files = find_openapi_files(source_dir)
+        for openapi_file in openapi_files:
+            try:
+                documents.extend(create_scraped_documents_from_openapi(openapi_file, source_dir))
+            except Exception as exc:
+                logger.error("Failed to load OpenAPI source %s: %s", openapi_file, exc)
 
         for skill_root in self._configured_skill_roots(source_dir):
             try:

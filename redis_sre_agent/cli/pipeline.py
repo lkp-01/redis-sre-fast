@@ -420,6 +420,7 @@ def prepare_sources(
         from pathlib import Path
 
         from ..pipelines.ingestion.processor import IngestionPipeline
+        from ..pipelines.ingestion.processor_source_helpers import find_supported_source_files
         from ..pipelines.scraper.base import ArtifactStorage
 
         source_path = Path(source_dir)
@@ -443,15 +444,13 @@ def prepare_sources(
         click.echo(f"📂 Preparing source documents from: {source_path}")
         click.echo(f"📅 Batch date: {batch_date_to_use}")
 
-        # Find all markdown files (excluding README files)
-        markdown_files = list(source_path.rglob("*.md"))
-        markdown_files = [f for f in markdown_files if f.name.lower() != "readme.md"]
+        source_files = find_supported_source_files(source_path)
 
-        if not markdown_files:
-            click.echo(f"❌ No markdown files found in {source_path}")
+        if not source_files:
+            click.echo(f"❌ No supported source files found in {source_path}")
             return
 
-        click.echo(f"📋 Found {len(markdown_files)} files to prepare")
+        click.echo(f"📋 Found {len(source_files)} files to prepare")
 
         try:
             pipeline = IngestionPipeline(storage)

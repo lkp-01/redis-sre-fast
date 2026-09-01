@@ -51,7 +51,7 @@ class DocumentProcessor:
                 "chunk_size": 1000,
                 "chunk_overlap": 200,
                 "min_chunk_size": 100,
-                "max_chunks_per_doc": 10,
+                "max_chunks_per_doc": 100,
                 "splitting_strategy": "recursive",
                 "enable_metadata_extraction": True,
                 "enable_semantic_chunking": False,
@@ -100,7 +100,10 @@ class DocumentProcessor:
                         end = word_break
 
             chunk_content = content[start:end].strip()
-            if len(chunk_content) >= self.config["min_chunk_size"]:
+            is_final_chunk = end >= len(content)
+            if chunk_content and (
+                len(chunk_content) >= self.config["min_chunk_size"] or is_final_chunk
+            ):
                 chunks.append(self._create_chunk(document, chunk_content, chunk_index))
                 chunk_index += 1
 
@@ -132,7 +135,7 @@ class DocumentProcessor:
             "title": chunk_title,
             "content": content,
             "source": document.source_url,
-            "category": document.category.value,
+            "category": str(document.metadata.get("retrieval_category") or document.category.value),
             "doc_type": doc_type,
             "name": name,
             "summary": summary_str,

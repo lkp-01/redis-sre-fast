@@ -438,6 +438,8 @@ class DocumentDeduplicator:
                     "title": chunk["title"],
                     "content": chunk["content"],
                     "source": chunk["source"],
+                    "source_document_path": chunk.get("source_document_path", ""),
+                    "source_document_scope": chunk.get("source_document_scope", ""),
                     "category": chunk["category"],
                     "doc_type": chunk["doc_type"],
                     "name": chunk.get("name", chunk.get("title", "")),

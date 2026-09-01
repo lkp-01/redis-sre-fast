@@ -61,6 +61,14 @@ def _build_document_schema(index_name: str, include_pinned: bool) -> dict:
             "type": "tag",
         },
         {
+            "name": "source_document_path",
+            "type": "tag",
+        },
+        {
+            "name": "source_document_scope",
+            "type": "tag",
+        },
+        {
             "name": "category",
             "type": "tag",
         },
