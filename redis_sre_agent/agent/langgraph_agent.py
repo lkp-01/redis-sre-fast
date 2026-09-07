@@ -24,7 +24,6 @@ from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 from opentelemetry import trace
-from pydantic import BaseModel, Field
 
 from ..agent.router import format_conversation_context, query_needs_live_redis_scope
 from ..core.agent_memory import prepare_agent_turn_memory
@@ -464,16 +463,6 @@ class AgentState(TypedDict):
     startup_prompt_initialized: NotRequired[bool]
     instance_context: Optional[Dict[str, Any]]  # For Redis instance context
     signals_envelopes: List[Dict[str, Any]]  # Accumulated tool result envelopes across steps
-
-
-class SREToolCall(BaseModel):
-    """Model for SRE tool call requests."""
-
-    tool_name: str = Field(..., description="Name of the SRE tool to call")
-    arguments: Dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
-    tool_call_id: str = Field(
-        default_factory=lambda: str(uuid4()), description="Unique tool call ID"
-    )
 
 
 class SRELangGraphAgent:
@@ -1230,25 +1219,7 @@ JSON payload of analyses artifacts:
             """
             messages = state["messages"]
 
-            # 1) Extract structured tool results from ToolMessage content
-            def _parse_tool_json_blocks(tool_msg_text: str) -> Optional[dict]:
-                try:
-                    # Heuristic: after "Result:" find first JSON object
-                    idx = tool_msg_text.find("Result:")
-                    if idx == -1:
-                        idx = tool_msg_text.find("Result\n")
-                    payload = tool_msg_text[idx + 7 :] if idx != -1 else tool_msg_text
-                    # Find first '{'
-                    j = payload.find("{")
-                    if j == -1:
-                        return None
-                    candidate = payload[j:]
-                    # Try to load as JSON directly
-                    return json.loads(candidate)
-                except Exception:
-                    return None
-
-            # New path: topic extraction with structured output based on summarized envelopes
+            # Extract topics from summarized tool evidence.
             envelopes = state.get("signals_envelopes") or []
             logger.info(f"Reasoning: envelopes captured={len(envelopes)}")
 
@@ -1497,38 +1468,6 @@ JSON payload of analyses artifacts:
         display_name = operation.replace("_", " ")
         return f"I'm running {display_name}..."
 
-    def _generate_completion_reflection(self, tool_name: str, result: dict) -> str:
-        """Generate a short, first-person reflection after a tool completes.
-
-        This is intentionally minimal to satisfy unit tests and provide
-        user-friendly progress updates.
-        """
-        # Knowledge search completion should not add extra chatter
-        if tool_name == "search_knowledge_base":
-            return ""
-
-        # Specialized handling for Redis diagnostics
-        if tool_name == "get_detailed_redis_diagnostics":
-            status = (result or {}).get("status")
-            if status == "success":
-                # If memory diagnostics are present, mention memory usage explicitly
-                try:
-                    mem = (result.get("diagnostics", {}) or {}).get("memory", {})
-                    used = mem.get("used_memory_bytes")
-                    maxm = mem.get("maxmemory_bytes")
-                    if used is not None and maxm is not None:
-                        return f"Memory usage: {used} bytes used out of {maxm}. I can recommend actions next."
-                except Exception:
-                    pass
-                return "Diagnostics collected successfully."
-            else:
-                return (
-                    "I wasn't able to collect the diagnostics. Let me try a different approach..."
-                )
-
-        # Default generic completion message
-        display = (tool_name or "").replace("_", " ").strip()
-        return f"I've completed {display}."
 
     async def _process_query(
         self,

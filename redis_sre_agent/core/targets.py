@@ -1109,18 +1109,6 @@ def _looks_like_hostname_term(value: str) -> bool:
     return any("-" in label or any(ch.isdigit() for ch in label) for label in labels)
 
 
-def _contains_token_sequence(haystack: Sequence[str], needle: Sequence[str]) -> bool:
-    """Return True when `needle` appears contiguously inside `haystack`."""
-    if not needle or len(needle) > len(haystack):
-        return False
-    needle_list = list(needle)
-    window = len(needle_list)
-    for index in range(len(haystack) - window + 1):
-        if list(haystack[index : index + window]) == needle_list:
-            return True
-    return False
-
-
 def _query_contains_exact_term(normalized_query: str, normalized_term: str) -> bool:
     """Return True when an exact target term appears on identifier boundaries."""
     if not normalized_query or not normalized_term:

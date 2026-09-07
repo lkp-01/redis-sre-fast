@@ -157,3 +157,6 @@ source_documents/packs
 # Local runtime state
 *.pid
 .artifacts/
+
+# 加了5000多篇文章
+source_documents/

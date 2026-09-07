@@ -11,4 +11,4 @@ tests/quality/test_oss_only_residuals.py
 
 # The product-scope policy requires this exact sentence in both agent prompts.
 redis_sre_agent/agent/prompts.py:14
-redis_sre_agent/agent/chat_agent.py:303
+redis_sre_agent/agent/chat_agent.py:86

@@ -13,6 +13,7 @@ Metrics evaluated:
 """
 
 import logging
+import re
 import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -67,6 +68,26 @@ class RetrievalEvaluator:
 
     def __init__(self, k_values: List[int] = None):
         self.k_values = k_values or [1, 3, 5, 10]
+
+    @staticmethod
+    def _base_document_title(title: str) -> str:
+        """Normalize a chunk title to the title of its source document."""
+        return re.sub(r"\s*\(part\s+\d+\)\s*$", "", title, flags=re.IGNORECASE).strip()
+
+    @classmethod
+    def deduplicate_retrieved_documents(cls, retrieved_docs: List[str]) -> List[str]:
+        """Keep the highest-ranked chunk for each logical document title."""
+        deduplicated = []
+        seen_titles = set()
+
+        for title in retrieved_docs:
+            document_title = cls._base_document_title(title).casefold()
+            if document_title in seen_titles:
+                continue
+            seen_titles.add(document_title)
+            deduplicated.append(title)
+
+        return deduplicated
 
     def calculate_precision_at_k(self, retrieved: List[str], relevant: List[str], k: int) -> float:
         """Calculate Precision@K."""
@@ -226,6 +247,12 @@ class RetrievalEvaluator:
                     title = result.get("title", "") if isinstance(result, dict) else ""
                     if title:
                         retrieved_docs.append(title)
+
+            # Retrieval operates on chunks, while the relevance labels identify
+            # logical documents. Keep only the highest-ranked chunk for each
+            # document so repeated "(Part N)" chunks cannot occupy multiple
+            # evaluation positions or count as multiple relevant documents.
+            retrieved_docs = self.deduplicate_retrieved_documents(retrieved_docs)
 
             logger.info(f"Retrieved {len(retrieved_docs)} documents for query")
 
@@ -432,7 +459,14 @@ def get_redis_retrieval_test_cases() -> List[RetrievalTestCase]:
         ),
         RetrievalTestCase(
             query="Redis JSON operations and search",
-            relevant_docs=["JSONGET", "JSONSET", "JSONDEL", "JSONTYPE", "JSON", "Search and query"],
+            relevant_docs=[
+                "JSON.GET",
+                "JSON.SET",
+                "JSON.DEL",
+                "JSON.TYPE",
+                "JSON",
+                "Search and query",
+            ],
             description="Query about Redis JSON functionality",
             difficulty="medium",
         ),
@@ -463,7 +497,7 @@ def get_redis_retrieval_test_cases() -> List[RetrievalTestCase]:
         ),
         RetrievalTestCase(
             query="Redis hash operations HSET HGET",
-            relevant_docs=["HSET", "HGET", "HGETALL", "HMGET", "HMSET          (deprecated)"],
+            relevant_docs=["HSET", "HGET", "HGETALL", "HMGET", "HMSET"],
             description="Query about Redis hash data type operations",
             difficulty="easy",
         ),
@@ -481,7 +515,7 @@ def get_redis_retrieval_test_cases() -> List[RetrievalTestCase]:
         ),
         RetrievalTestCase(
             query="Redis full-text search index creation and querying",
-            relevant_docs=["FTCREATE", "FTSEARCH", "FTINFO", "Search and query"],
+            relevant_docs=["FT.CREATE", "FT.SEARCH", "FT.INFO", "Search and query"],
             description="Query about Redis Search module functionality",
             difficulty="hard",
         ),
